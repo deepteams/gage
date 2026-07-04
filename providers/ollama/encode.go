@@ -2,6 +2,7 @@ package ollama
 
 import (
 	"encoding/json"
+	"fmt"
 	"maps"
 
 	"github.com/deepteams/gage"
@@ -12,6 +13,9 @@ func buildNativeBody(req gage.Request, defaultModel string) ([]byte, error) {
 	model := req.Model
 	if model == "" {
 		model = defaultModel
+	}
+	if model == "" {
+		return nil, fmt.Errorf("ollama: no model specified")
 	}
 	body := map[string]any{
 		"model":    model,

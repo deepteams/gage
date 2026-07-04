@@ -1,10 +1,12 @@
 package tools
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"reflect"
 	"strings"
 
@@ -47,7 +49,16 @@ func TypedWithMetadata[T any](name, description string, meta gage.ToolMetadata, 
 			if len(input) == 0 {
 				input = json.RawMessage(`{}`)
 			}
-			if err := json.Unmarshal(input, &args); err != nil {
+			dec := json.NewDecoder(bytes.NewReader(input))
+			dec.DisallowUnknownFields()
+			if err := dec.Decode(&args); err != nil {
+				return gage.ErrorResult("", unmarshalErrorMessage(name, err)), nil
+			}
+			var extra any
+			if err := dec.Decode(&extra); err != io.EOF {
+				if err == nil {
+					err = fmt.Errorf("multiple JSON values")
+				}
 				return gage.ErrorResult("", unmarshalErrorMessage(name, err)), nil
 			}
 			return fn(ctx, args)

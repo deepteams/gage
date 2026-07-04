@@ -11,13 +11,15 @@ import (
 )
 
 // runLoop drives the agentic loop, sending every event on out. It does not
-// close out (the caller does).
-func (a *Agent) runLoop(ctx context.Context, input []gage.Message, out chan<- gage.Event, runID string) {
+// close out (the caller does). ctx bounds model/tool execution; sendCtx bounds
+// delivery to the consumer, so an agent-owned timeout can still be reported as
+// a terminal error event before the stream closes.
+func (a *Agent) runLoop(ctx, sendCtx context.Context, input []gage.Message, out chan<- gage.Event, runID string) {
 	send := func(e gage.Event) bool {
 		select {
 		case out <- e:
 			return true
-		case <-ctx.Done():
+		case <-sendCtx.Done():
 			return false
 		}
 	}
@@ -92,6 +94,10 @@ func (a *Agent) runLoop(ctx context.Context, input []gage.Message, out chan<- ga
 		asst, streamErr := a.consume(ctx, turn, stream, send)
 		if streamErr != nil {
 			// consume already forwarded an error event or ctx was cancelled.
+			if ctx.Err() != nil {
+				fail(turn, ctx.Err())
+				return
+			}
 			runErr = streamErr.Error()
 			return
 		}
@@ -131,7 +137,7 @@ func (a *Agent) runLoop(ctx context.Context, input []gage.Message, out chan<- ga
 		results, ok := a.execTools(ctx, runID, turn, asst.toolCalls, send)
 		if !ok {
 			if ctx.Err() != nil {
-				runErr = ctx.Err().Error()
+				fail(turn, ctx.Err())
 			}
 			return
 		}
@@ -210,9 +216,6 @@ func (acc *assistantAccum) text() string {
 func (acc *assistantAccum) message() (gage.Message, bool) {
 	acc.flush("")
 	content := append([]gage.ContentPart(nil), acc.parts...)
-	for _, tc := range acc.toolCalls {
-		content = append(content, gage.ToolUsePart(tc))
-	}
 	if len(content) == 0 {
 		return gage.Message{}, false
 	}
@@ -243,6 +246,7 @@ func (a *Agent) consume(ctx context.Context, turn int, stream <-chan gage.Event,
 			if ev.ToolCall != nil {
 				acc.flush("")
 				acc.toolCalls = append(acc.toolCalls, *ev.ToolCall)
+				acc.parts = append(acc.parts, gage.ToolUsePart(*ev.ToolCall))
 			}
 		case gage.EventUsage:
 			if ev.Usage != nil {

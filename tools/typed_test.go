@@ -127,6 +127,35 @@ func TestTypedUnmarshalErrorNamesField(t *testing.T) {
 	}
 }
 
+func TestTypedRejectsUnknownFields(t *testing.T) {
+	type args struct {
+		Name   string `json:"name"`
+		Target struct {
+			Region string `json:"region"`
+		} `json:"target"`
+	}
+	tool := Typed("deploy", "Deploy.", func(ctx context.Context, a args) (gage.ToolResult, error) {
+		t.Fatal("handler must not run on unknown fields")
+		return gage.ToolResult{}, nil
+	})
+
+	res, err := tool.Execute(context.Background(), json.RawMessage(`{"name":"api","target":{"region":"eu"},"extra":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.IsError || !strings.Contains(res.Text(), `unknown field "extra"`) {
+		t.Fatalf("expected unknown field error, got %q", res.Text())
+	}
+
+	res, err = tool.Execute(context.Background(), json.RawMessage(`{"name":"api","target":{"region":"eu","zone":"1"}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.IsError || !strings.Contains(res.Text(), `unknown field "zone"`) {
+		t.Fatalf("expected nested unknown field error, got %q", res.Text())
+	}
+}
+
 func TestTypedWithMetadata(t *testing.T) {
 	type args struct{}
 	tool := TypedWithMetadata("m", "meta tool", gage.ToolMetadata{ReadOnly: true, Network: true},

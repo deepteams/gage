@@ -232,6 +232,14 @@ func TestResponsesStopSequencesUnsupported(t *testing.T) {
 	}
 }
 
+func TestResponsesModelRequired(t *testing.T) {
+	c := &ResponsesClient{ProviderName: "codex", URL: "http://127.0.0.1:0"}
+	_, err := c.Stream(context.Background(), gage.Request{Messages: []gage.Message{gage.UserText("hi")}})
+	if err == nil || !strings.Contains(err.Error(), "no model specified") {
+		t.Fatalf("err = %v, want no model specified", err)
+	}
+}
+
 func TestResponsesAuthorizerInvoked(t *testing.T) {
 	var gotAuth string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -244,6 +252,7 @@ func TestResponsesAuthorizerInvoked(t *testing.T) {
 	c := &ResponsesClient{
 		ProviderName: "codex",
 		URL:          srv.URL,
+		DefaultModel: "gpt",
 		Authorize: func(ctx context.Context, req *http.Request) error {
 			req.Header.Set("Authorization", "Bearer tok123")
 			return nil

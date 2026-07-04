@@ -30,22 +30,21 @@ func New(cfg Config) (*Agent, error) {
 func (a *Agent) Run(ctx context.Context, input []gage.Message) (<-chan gage.Event, error) {
 	runID := nextRunID()
 	if a.cfg.Timeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, a.cfg.Timeout)
+		runCtx, cancel := context.WithTimeout(ctx, a.cfg.Timeout)
 		// cancel is called when the loop goroutine finishes (see runLoop).
-		return a.start(ctx, input, cancel, runID), nil
+		return a.start(runCtx, ctx, input, cancel, runID), nil
 	}
-	return a.start(ctx, input, nil, runID), nil
+	return a.start(ctx, ctx, input, nil, runID), nil
 }
 
-func (a *Agent) start(ctx context.Context, input []gage.Message, cancel context.CancelFunc, runID string) <-chan gage.Event {
+func (a *Agent) start(runCtx, sendCtx context.Context, input []gage.Message, cancel context.CancelFunc, runID string) <-chan gage.Event {
 	out := make(chan gage.Event)
 	go func() {
 		defer close(out)
 		if cancel != nil {
 			defer cancel()
 		}
-		a.runLoop(ctx, input, out, runID)
+		a.runLoop(runCtx, sendCtx, input, out, runID)
 	}()
 	return out
 }
@@ -58,6 +57,11 @@ func nextRunID() string {
 // summary. Streaming consumers should use Run; RunSync is the convenience for
 // callers that only want the outcome.
 func (a *Agent) RunSync(ctx context.Context, input []gage.Message) (*gage.Result, error) {
+	if a.cfg.Timeout > 0 {
+		runCtx, cancel := context.WithTimeout(ctx, a.cfg.Timeout)
+		defer cancel()
+		return Collect(runCtx, a.start(runCtx, ctx, input, nil, nextRunID()))
+	}
 	stream, err := a.Run(ctx, input)
 	if err != nil {
 		return nil, err

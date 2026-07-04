@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"sync"
 	"testing"
@@ -49,6 +50,24 @@ func (m *mockProvider) Stream(ctx context.Context, req gage.Request) (<-chan gag
 
 func toolCallDone(id, name, args string) gage.Event {
 	return gage.ToolCallDone(gage.ToolCall{ID: id, Name: name, Input: json.RawMessage(args)})
+}
+
+type waitingProvider struct{}
+
+func (waitingProvider) Name() string { return "waiting" }
+
+func (waitingProvider) Stream(ctx context.Context, req gage.Request) (<-chan gage.Event, error) {
+	ch := make(chan gage.Event)
+	go func() {
+		defer close(ch)
+		select {
+		case ch <- gage.MessageStart():
+		case <-ctx.Done():
+			return
+		}
+		<-ctx.Done()
+	}()
+	return ch, nil
 }
 
 func TestAgentSingleTurnNoTools(t *testing.T) {
@@ -395,6 +414,38 @@ func TestRunSyncResult(t *testing.T) {
 	}
 }
 
+func TestRunSyncConfigTimeoutReturnsDeadlineExceeded(t *testing.T) {
+	ag, _ := New(Config{Provider: waitingProvider{}, Timeout: 10 * time.Millisecond})
+	_, err := ag.RunSync(context.Background(), []gage.Message{gage.UserText("hi")})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want DeadlineExceeded", err)
+	}
+}
+
+func TestRunConfigTimeoutEmitsErrorEvent(t *testing.T) {
+	ag, _ := New(Config{Provider: waitingProvider{}, Timeout: 10 * time.Millisecond})
+	ch, err := ag.Run(context.Background(), []gage.Message{gage.UserText("hi")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sawStart bool
+	var terminal error
+	for ev := range ch {
+		switch ev.Type {
+		case gage.EventMessageStart:
+			sawStart = true
+		case gage.EventError:
+			terminal = ev.Err
+		}
+	}
+	if !sawStart {
+		t.Fatal("expected initial message_start")
+	}
+	if !errors.Is(terminal, context.DeadlineExceeded) {
+		t.Fatalf("terminal error = %v, want DeadlineExceeded", terminal)
+	}
+}
+
 func TestUsageAggregatedAcrossTurns(t *testing.T) {
 	reg := tools.NewRegistry()
 	reg.MustRegister(tools.ToolFuncMust("echo", "echo", func(ctx context.Context, input json.RawMessage) (gage.ToolResult, error) {
@@ -455,6 +506,49 @@ func TestReasoningPreservedInHistory(t *testing.T) {
 		t.Fatalf("reasoning part = %+v", p)
 	}
 	if asst.Content[1].Kind != gage.PartText || asst.Content[2].Kind != gage.PartToolUse {
+		t.Fatalf("part order = %+v", asst.Content)
+	}
+}
+
+func TestAssistantHistoryPreservesInterleavedToolOrder(t *testing.T) {
+	reg := tools.NewRegistry()
+	reg.MustRegister(tools.ToolFuncMust("echo", "echo", func(ctx context.Context, input json.RawMessage) (gage.ToolResult, error) {
+		return gage.TextResult("", "ok"), nil
+	}))
+	mp := &mockProvider{turns: [][]gage.Event{
+		{
+			gage.MessageStart(),
+			gage.TextDelta("before "),
+			toolCallDone("c1", "echo", `{}`),
+			gage.TextDelta("after"),
+			gage.MessageDone(gage.StopToolUse),
+		},
+		{gage.MessageStart(), gage.TextDelta("done"), gage.MessageDone(gage.StopEndTurn)},
+	}}
+	ag, _ := New(Config{Provider: mp, Registry: reg})
+	if _, err := ag.RunSync(context.Background(), []gage.Message{gage.UserText("x")}); err != nil {
+		t.Fatal(err)
+	}
+
+	mp.mu.Lock()
+	msgs := mp.lastReq.Messages
+	mp.mu.Unlock()
+	var asst *gage.Message
+	for i := range msgs {
+		if msgs[i].Role == gage.RoleAssistant {
+			asst = &msgs[i]
+			break
+		}
+	}
+	if asst == nil {
+		t.Fatal("no assistant message in history")
+	}
+	if len(asst.Content) != 3 {
+		t.Fatalf("content = %+v", asst.Content)
+	}
+	if asst.Content[0].Kind != gage.PartText || asst.Content[0].Text != "before " ||
+		asst.Content[1].Kind != gage.PartToolUse ||
+		asst.Content[2].Kind != gage.PartText || asst.Content[2].Text != "after" {
 		t.Fatalf("part order = %+v", asst.Content)
 	}
 }

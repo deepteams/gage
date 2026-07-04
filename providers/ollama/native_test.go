@@ -188,6 +188,14 @@ func TestNativeToolChoiceUnsupported(t *testing.T) {
 	}
 }
 
+func TestNativeModelRequired(t *testing.T) {
+	p := New("http://127.0.0.1:0")
+	_, err := p.Stream(context.Background(), gage.Request{Messages: []gage.Message{gage.UserText("hi")}})
+	if err == nil || !strings.Contains(err.Error(), "no model specified") {
+		t.Fatalf("err = %v, want no model specified", err)
+	}
+}
+
 func TestNativeToolResultsCarryToolName(t *testing.T) {
 	msgs := toNativeMessages("", []gage.Message{
 		gage.UserText("q"),

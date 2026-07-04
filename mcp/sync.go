@@ -14,9 +14,9 @@ import (
 // SyncTools re-lists the server's tools and reconciles the registry passed to
 // WithToolSync: tools that disappeared from the server are unregistered, new
 // ones are registered, and changed ones (different description or schema) are
-// replaced. Only tools carrying this client's "<server>__" prefix are touched.
-// It is the manual counterpart of the tools/list_changed notification handler
-// and is safe to call concurrently with it.
+// replaced. Only tools carrying this client's normalized "<server>__" prefix
+// are touched. It is the manual counterpart of the tools/list_changed
+// notification handler and is safe to call concurrently with it.
 func (c *Client) SyncTools(ctx context.Context) error {
 	if c.syncReg == nil {
 		return fmt.Errorf("mcp: sync tools %s: no registry (use WithToolSync)", c.name)
@@ -42,7 +42,7 @@ func (c *Client) syncTools(ctx context.Context, session *mcpsdk.ClientSession) e
 
 	// Drop or mark-for-replacement everything of ours that is currently
 	// registered; leave other servers' tools alone.
-	prefix := c.name + "__"
+	prefix := exposedToolPrefix(c.name)
 	for _, existing := range c.syncReg.List() {
 		name := existing.Name()
 		if !strings.HasPrefix(name, prefix) {

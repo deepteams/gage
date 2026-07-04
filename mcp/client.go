@@ -158,8 +158,9 @@ func (c *Client) Close() error {
 func (c *Client) Name() string { return c.name }
 
 // Tools discovers the server's tools and adapts them to gage.Tool. Tool names
-// are prefixed with the server name ("<server>__<tool>") to avoid collisions in
-// a shared registry. Pagination is followed to completion.
+// are prefixed with a provider-safe server name ("<server>__<tool>", with
+// unsafe characters normalized) to avoid collisions in a shared registry.
+// Pagination is followed to completion.
 func (c *Client) Tools(ctx context.Context) ([]gage.Tool, error) {
 	return listTools(ctx, c.session, c.name)
 }

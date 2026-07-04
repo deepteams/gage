@@ -289,13 +289,21 @@ func TestChatAssistantMessageNeverEmpty(t *testing.T) {
 	}
 }
 
+func TestChatModelRequired(t *testing.T) {
+	c := &ChatClient{ProviderName: "test", BaseURL: "http://127.0.0.1:0"}
+	_, err := c.Stream(context.Background(), gage.Request{Messages: []gage.Message{gage.UserText("hi")}})
+	if err == nil || !strings.Contains(err.Error(), "no model specified") {
+		t.Fatalf("err = %v, want no model specified", err)
+	}
+}
+
 func TestChatStreamAPIError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
 		io.WriteString(w, `{"error":"nope"}`)
 	}))
 	t.Cleanup(srv.Close)
-	c := &ChatClient{ProviderName: "test", BaseURL: srv.URL}
+	c := &ChatClient{ProviderName: "test", BaseURL: srv.URL, DefaultModel: "m"}
 	_, err := c.Stream(context.Background(), gage.Request{})
 	if err == nil {
 		t.Fatal("expected error")

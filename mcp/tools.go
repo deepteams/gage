@@ -5,6 +5,8 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
+	"strings"
 
 	"github.com/deepteams/gage"
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
@@ -22,11 +24,57 @@ type mcpTool struct {
 func adaptTool(session *mcpsdk.ClientSession, server string, t *mcpsdk.Tool) gage.Tool {
 	return &mcpTool{
 		session:  session,
-		fullName: server + "__" + t.Name,
+		fullName: exposedToolName(server, t.Name),
 		rawName:  t.Name,
 		desc:     t.Description,
 		schema:   marshalSchema(t.InputSchema),
 	}
+}
+
+func exposedToolName(server, tool string) string {
+	return safeToolIdent(server) + "__" + safeToolIdent(tool)
+}
+
+func exposedToolPrefix(server string) string {
+	return safeToolIdent(server) + "__"
+}
+
+func safeToolIdent(raw string) string {
+	const maxLen = 31 // 31 + "__" + 31 keeps the exposed tool name <= 64 bytes.
+	var b strings.Builder
+	lastUnderscore := false
+	for _, r := range raw {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-' {
+			b.WriteRune(r)
+			lastUnderscore = false
+			continue
+		}
+		if !lastUnderscore {
+			b.WriteByte('_')
+			lastUnderscore = true
+		}
+	}
+	name := strings.Trim(b.String(), "_")
+	if name == "" {
+		name = "tool"
+	}
+	if name == raw && len(name) <= maxLen {
+		return name
+	}
+	suffix := fmt.Sprintf("_%08x", hashToolIdent(raw))
+	if budget := maxLen - len(suffix); len(name) > budget {
+		name = strings.Trim(name[:budget], "_-")
+		if name == "" {
+			name = "tool"
+		}
+	}
+	return name + suffix
+}
+
+func hashToolIdent(s string) uint32 {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(s))
+	return h.Sum32()
 }
 
 func (t *mcpTool) Name() string            { return t.fullName }

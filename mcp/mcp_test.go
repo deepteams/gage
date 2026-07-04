@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 
@@ -68,6 +69,33 @@ func TestMCPDiscoveryAndCall(t *testing.T) {
 	}
 	if _, ok := reg.Get("calc__add"); !ok {
 		t.Fatal("tool not registered")
+	}
+}
+
+func TestMCPToolNameNormalizationKeepsRawName(t *testing.T) {
+	tool := adaptTool(nil, "my server", &mcpsdk.Tool{Name: "read/file", Description: "read"}).(*mcpTool)
+	if tool.rawName != "read/file" {
+		t.Fatalf("rawName = %q", tool.rawName)
+	}
+	if strings.ContainsAny(tool.Name(), " /") {
+		t.Fatalf("tool name was not normalized: %q", tool.Name())
+	}
+	if len(tool.Name()) > 64 {
+		t.Fatalf("tool name too long: %q (%d)", tool.Name(), len(tool.Name()))
+	}
+	if !strings.Contains(tool.Name(), "__") {
+		t.Fatalf("tool name missing separator: %q", tool.Name())
+	}
+	if tool.Name() == "my server__read/file" {
+		t.Fatalf("tool name still uses raw identifiers: %q", tool.Name())
+	}
+	unchanged := adaptTool(nil, "calc", &mcpsdk.Tool{Name: "add"}).Name()
+	if unchanged != "calc__add" {
+		t.Fatalf("safe names should stay readable, got %q", unchanged)
+	}
+	long := adaptTool(nil, strings.Repeat("s", 80), &mcpsdk.Tool{Name: strings.Repeat("t", 80)}).Name()
+	if len(long) > 64 {
+		t.Fatalf("long tool name was not capped: %q (%d)", long, len(long))
 	}
 }
 
