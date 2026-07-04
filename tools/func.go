@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 
 	"github.com/deepteams/gage"
-	"github.com/deepteams/gage/internal/jsonschema"
+	"github.com/deepteams/gage/jsonschema"
 )
 
 // Func builds a gage.Tool from a function and an explicit parameter schema.

@@ -23,6 +23,21 @@ func toResponsesInput(msgs []gage.Message) []map[string]any {
 				}
 			}
 		case gage.RoleAssistant:
+			// Replay signed reasoning items first so the server restores the
+			// reasoning context ahead of the turn's message/function calls.
+			// Best effort: the original item id and summary are not retained;
+			// the API accepts encrypted_content-only reasoning items when
+			// store=false. Unsigned reasoning parts are skipped (there is
+			// nothing the server would accept back).
+			for _, p := range m.Content {
+				if p.Kind == gage.PartReasoning && p.Signature != "" {
+					out = append(out, map[string]any{
+						"type":              "reasoning",
+						"encrypted_content": p.Signature,
+						"summary":           []any{},
+					})
+				}
+			}
 			// Emit text as an output message and each tool use as a function_call.
 			if txt := m.Text(); txt != "" {
 				out = append(out, map[string]any{
@@ -65,6 +80,19 @@ func toResponsesTools(tools []gage.ToolSchema) []map[string]any {
 	return out
 }
 
+func toResponsesToolChoice(tc gage.ToolChoice) any {
+	switch tc.Mode {
+	case gage.ToolChoiceNone:
+		return "none"
+	case gage.ToolChoiceRequired:
+		return "required"
+	case gage.ToolChoiceTool:
+		return map[string]any{"type": "function", "name": tc.Name}
+	default:
+		return "auto"
+	}
+}
+
 func nonEmptyRaw(r json.RawMessage) json.RawMessage {
 	if len(r) == 0 {
 		return json.RawMessage("{}")
@@ -88,6 +116,9 @@ type responsesItem struct {
 	ID     string `json:"id"`
 	CallID string `json:"call_id"`
 	Name   string `json:"name"`
+	// EncryptedContent is the opaque replay token of a reasoning item,
+	// present when the request included "reasoning.encrypted_content".
+	EncryptedContent string `json:"encrypted_content"`
 }
 
 type responsesResult struct {

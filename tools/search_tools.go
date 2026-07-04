@@ -13,7 +13,7 @@ import (
 	"strings"
 
 	"github.com/deepteams/gage"
-	"github.com/deepteams/gage/internal/jsonschema"
+	"github.com/deepteams/gage/jsonschema"
 )
 
 // NewSearchTools returns the grep and glob tools confined to cfg.Root.
@@ -33,24 +33,40 @@ func (t *grepTool) Description() string {
 }
 func (t *grepTool) Schema() gage.JSONSchema {
 	return jsonschema.Object(map[string]jsonschema.Property{
-		"pattern": jsonschema.Str("Regular expression (RE2 syntax)."),
-		"path":    jsonschema.Str("Directory or file to search (defaults to root)."),
-		"glob":    jsonschema.Str("Optional filename glob filter, e.g. *.go."),
+		"pattern":          jsonschema.Str("Regular expression (RE2 syntax)."),
+		"path":             jsonschema.Str("Directory or file to search (defaults to root)."),
+		"glob":             jsonschema.Str("Optional filename glob filter, e.g. *.go."),
+		"case_insensitive": jsonschema.Bool("Match case-insensitively (like grep -i)."),
+		"context":          jsonschema.Int("Number of context lines to include before and after each match (like grep -C)."),
 	}, "pattern")
 }
 
+const maxContextLines = 10
+
 func (t *grepTool) Execute(ctx context.Context, input json.RawMessage) (gage.ToolResult, error) {
 	var args struct {
-		Pattern string `json:"pattern"`
-		Path    string `json:"path"`
-		Glob    string `json:"glob"`
+		Pattern         string `json:"pattern"`
+		Path            string `json:"path"`
+		Glob            string `json:"glob"`
+		CaseInsensitive bool   `json:"case_insensitive"`
+		Context         int    `json:"context"`
 	}
 	if err := json.Unmarshal(input, &args); err != nil {
 		return gage.ToolResult{}, err
 	}
-	re, err := regexp.Compile(args.Pattern)
+	pattern := args.Pattern
+	if args.CaseInsensitive {
+		pattern = "(?i)" + pattern
+	}
+	re, err := regexp.Compile(pattern)
 	if err != nil {
 		return errResult(fmt.Errorf("invalid pattern: %w", err)), nil
+	}
+	if args.Context < 0 {
+		args.Context = 0
+	}
+	if args.Context > maxContextLines {
+		args.Context = maxContextLines
 	}
 	if args.Path == "" {
 		args.Path = "."
@@ -83,14 +99,17 @@ func (t *grepTool) Execute(ctx context.Context, input json.RawMessage) (gage.Too
 			}
 		}
 		rel, _ := filepath.Rel(base, path)
-		matchFile(path, rel, re, &matches)
+		matchFile(path, rel, re, args.Context, &matches)
 		if len(matches) >= maxMatches {
 			return errStop
 		}
 		return nil
 	})
-	if walkErr != nil && walkErr != errStop && ctx.Err() != nil {
-		return gage.ToolResult{}, ctx.Err()
+	if walkErr != nil && walkErr != errStop {
+		if ctx.Err() != nil {
+			return gage.ToolResult{}, ctx.Err()
+		}
+		return errResult(walkErr), nil
 	}
 	if len(matches) == 0 {
 		return gage.TextResult("", "no matches"), nil
@@ -98,7 +117,11 @@ func (t *grepTool) Execute(ctx context.Context, input json.RawMessage) (gage.Too
 	return gage.TextResult("", strings.Join(matches, "\n")), nil
 }
 
-func matchFile(path, rel string, re *regexp.Regexp, matches *[]string) {
+// matchFile appends matching lines of one file to matches. Match lines use a
+// "file:line:text" prefix; when contextLines > 0, surrounding lines use
+// "file:line-text" and non-contiguous groups are separated by "--", like
+// grep -nC.
+func matchFile(path, rel string, re *regexp.Regexp, contextLines int, matches *[]string) {
 	f, err := os.Open(path)
 	if err != nil {
 		return
@@ -106,14 +129,64 @@ func matchFile(path, rel string, re *regexp.Regexp, matches *[]string) {
 	defer f.Close()
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
-	line := 0
-	for sc.Scan() {
-		line++
-		if re.Match(sc.Bytes()) {
-			*matches = append(*matches, fmt.Sprintf("%s:%d:%s", rel, line, sc.Text()))
-			if len(*matches) >= maxMatches {
-				return
+
+	if contextLines <= 0 {
+		line := 0
+		for sc.Scan() {
+			line++
+			if re.Match(sc.Bytes()) {
+				*matches = append(*matches, fmt.Sprintf("%s:%d:%s", rel, line, sc.Text()))
+				if len(*matches) >= maxMatches {
+					return
+				}
 			}
+		}
+		return
+	}
+
+	// Context requested: buffer the file's lines so windows can be assembled.
+	var lines []string
+	hit := map[int]bool{}
+	for sc.Scan() {
+		text := sc.Text()
+		if re.MatchString(text) {
+			hit[len(lines)] = true
+		}
+		lines = append(lines, text)
+	}
+	if len(hit) == 0 {
+		return
+	}
+	include := map[int]bool{}
+	for i := range hit {
+		lo := i - contextLines
+		if lo < 0 {
+			lo = 0
+		}
+		hi := i + contextLines
+		if hi > len(lines)-1 {
+			hi = len(lines) - 1
+		}
+		for j := lo; j <= hi; j++ {
+			include[j] = true
+		}
+	}
+	prev := -2
+	for i := 0; i < len(lines); i++ {
+		if !include[i] {
+			continue
+		}
+		if prev >= 0 && i != prev+1 {
+			*matches = append(*matches, "--")
+		}
+		sep := "-"
+		if hit[i] {
+			sep = ":"
+		}
+		*matches = append(*matches, fmt.Sprintf("%s:%d%s%s", rel, i+1, sep, lines[i]))
+		prev = i
+		if len(*matches) >= maxMatches {
+			return
 		}
 	}
 }
@@ -175,8 +248,11 @@ func (t *globTool) Execute(ctx context.Context, input json.RawMessage) (gage.Too
 		}
 		return nil
 	})
-	if walkErr != nil && walkErr != errStop && ctx.Err() != nil {
-		return gage.ToolResult{}, ctx.Err()
+	if walkErr != nil && walkErr != errStop {
+		if ctx.Err() != nil {
+			return gage.ToolResult{}, ctx.Err()
+		}
+		return errResult(walkErr), nil
 	}
 	sort.Strings(found)
 	if len(found) == 0 {

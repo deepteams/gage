@@ -185,8 +185,8 @@ func TestAgentApproverDeny(t *testing.T) {
 		{gage.MessageStart(), toolCallDone("c1", "danger", `{}`), gage.MessageDone("tool_use")},
 		{gage.MessageStart(), gage.TextDelta("stopped"), gage.MessageDone("end_turn")},
 	}}
-	deny := gage.ApproverFunc(func(ctx context.Context, r gage.PermissionRequest) (gage.Decision, error) {
-		return gage.Deny, nil
+	deny := gage.ApproverFunc(func(ctx context.Context, r gage.PermissionRequest) (gage.Approval, error) {
+		return gage.Denied("not allowed in tests"), nil
 	})
 	ag, _ := New(Config{Provider: mp, Registry: reg, Approver: deny})
 	ch, _ := ag.Run(context.Background(), []gage.Message{gage.UserText("x")})
@@ -213,9 +213,9 @@ func TestAgentApproverReceivesMetadataAndContext(t *testing.T) {
 		{gage.MessageStart(), gage.TextDelta("stopped"), gage.MessageDone("end_turn")},
 	}}
 	var req gage.PermissionRequest
-	deny := gage.ApproverFunc(func(ctx context.Context, r gage.PermissionRequest) (gage.Decision, error) {
+	deny := gage.ApproverFunc(func(ctx context.Context, r gage.PermissionRequest) (gage.Approval, error) {
 		req = r
-		return gage.Deny, nil
+		return gage.Denied(""), nil
 	})
 	ag, _ := New(Config{Provider: mp, Registry: reg, Approver: deny, Name: "main"})
 	ch, _ := ag.Run(context.Background(), []gage.Message{gage.UserText("x")})
@@ -372,5 +372,298 @@ func TestSubAgentAsToolReturnsOnlyFinalAnswer(t *testing.T) {
 func TestNewRequiresProvider(t *testing.T) {
 	if _, err := New(Config{}); err != gage.ErrNoProvider {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestRunSyncResult(t *testing.T) {
+	mp := &mockProvider{turns: [][]gage.Event{
+		{gage.MessageStart(), gage.TextDelta("Hello"), gage.UsageEvent(gage.Usage{InputTokens: 10, OutputTokens: 5}), gage.MessageDone(gage.StopEndTurn)},
+	}}
+	ag, _ := New(Config{Provider: mp})
+	res, err := ag.RunSync(context.Background(), []gage.Message{gage.UserText("hi")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Text != "Hello" || res.Turns != 1 || res.StopReason != gage.StopEndTurn {
+		t.Fatalf("result = %+v", res)
+	}
+	if res.Usage.InputTokens != 10 || res.Usage.OutputTokens != 5 {
+		t.Fatalf("usage = %+v", res.Usage)
+	}
+	if len(res.Messages) != 2 || res.Messages[1].Role != gage.RoleAssistant {
+		t.Fatalf("messages = %+v", res.Messages)
+	}
+}
+
+func TestUsageAggregatedAcrossTurns(t *testing.T) {
+	reg := tools.NewRegistry()
+	reg.MustRegister(tools.ToolFuncMust("echo", "echo", func(ctx context.Context, input json.RawMessage) (gage.ToolResult, error) {
+		return gage.TextResult("", "ok"), nil
+	}))
+	mp := &mockProvider{turns: [][]gage.Event{
+		{gage.MessageStart(), toolCallDone("c1", "echo", `{}`), gage.UsageEvent(gage.Usage{InputTokens: 10, OutputTokens: 2}), gage.MessageDone(gage.StopToolUse)},
+		{gage.MessageStart(), gage.TextDelta("done"), gage.UsageEvent(gage.Usage{InputTokens: 20, OutputTokens: 3}), gage.MessageDone(gage.StopEndTurn)},
+	}}
+	ag, _ := New(Config{Provider: mp, Registry: reg})
+	res, err := ag.RunSync(context.Background(), []gage.Message{gage.UserText("x")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Usage.InputTokens != 30 || res.Usage.OutputTokens != 5 || res.Turns != 2 {
+		t.Fatalf("usage = %+v turns = %d", res.Usage, res.Turns)
+	}
+}
+
+func TestReasoningPreservedInHistory(t *testing.T) {
+	reg := tools.NewRegistry()
+	reg.MustRegister(tools.ToolFuncMust("echo", "echo", func(ctx context.Context, input json.RawMessage) (gage.ToolResult, error) {
+		return gage.TextResult("", "ok"), nil
+	}))
+	mp := &mockProvider{turns: [][]gage.Event{
+		{
+			gage.MessageStart(),
+			gage.ReasoningDelta("thinking "), gage.ReasoningDelta("hard"), gage.ReasoningDone("sig-1"),
+			gage.TextDelta("calling tool"),
+			toolCallDone("c1", "echo", `{}`),
+			gage.MessageDone(gage.StopToolUse),
+		},
+		{gage.MessageStart(), gage.TextDelta("done"), gage.MessageDone(gage.StopEndTurn)},
+	}}
+	ag, _ := New(Config{Provider: mp, Registry: reg})
+	if _, err := ag.RunSync(context.Background(), []gage.Message{gage.UserText("x")}); err != nil {
+		t.Fatal(err)
+	}
+	// The second provider call must have replayed the signed reasoning block
+	// before the text and tool-use parts.
+	mp.mu.Lock()
+	msgs := mp.lastReq.Messages
+	mp.mu.Unlock()
+	var asst *gage.Message
+	for i := range msgs {
+		if msgs[i].Role == gage.RoleAssistant {
+			asst = &msgs[i]
+			break
+		}
+	}
+	if asst == nil {
+		t.Fatal("no assistant message in history")
+	}
+	if len(asst.Content) < 3 {
+		t.Fatalf("content = %+v", asst.Content)
+	}
+	if p := asst.Content[0]; p.Kind != gage.PartReasoning || p.Text != "thinking hard" || p.Signature != "sig-1" {
+		t.Fatalf("reasoning part = %+v", p)
+	}
+	if asst.Content[1].Kind != gage.PartText || asst.Content[2].Kind != gage.PartToolUse {
+		t.Fatalf("part order = %+v", asst.Content)
+	}
+}
+
+func TestHooksRewriteInputAndResult(t *testing.T) {
+	reg := tools.NewRegistry()
+	var gotInput string
+	reg.MustRegister(tools.ToolFuncMust("echo", "echo", func(ctx context.Context, input json.RawMessage) (gage.ToolResult, error) {
+		gotInput = string(input)
+		return gage.TextResult("", "secret=hunter2"), nil
+	}))
+	mp := &mockProvider{turns: [][]gage.Event{
+		{gage.MessageStart(), toolCallDone("c1", "echo", `{"text":"raw"}`), gage.MessageDone(gage.StopToolUse)},
+		{gage.MessageStart(), gage.TextDelta("done"), gage.MessageDone(gage.StopEndTurn)},
+	}}
+	ag, _ := New(Config{Provider: mp, Registry: reg, Hooks: Hooks{
+		PreToolUse: func(ctx context.Context, tc gage.ToolCall) (gage.ToolCall, error) {
+			tc.Input = json.RawMessage(`{"text":"rewritten"}`)
+			return tc, nil
+		},
+		PostToolUse: func(ctx context.Context, tc gage.ToolCall, res gage.ToolResult) gage.ToolResult {
+			return gage.TextResult(res.CallID, strings.ReplaceAll(res.Text(), "hunter2", "[redacted]"))
+		},
+	}})
+	ch, _ := ag.Run(context.Background(), []gage.Message{gage.UserText("x")})
+	var res *gage.ToolResult
+	for e := range ch {
+		if e.Type == gage.EventToolResult {
+			res = e.ToolResult
+		}
+	}
+	if gotInput != `{"text":"rewritten"}` {
+		t.Fatalf("tool saw input %q", gotInput)
+	}
+	if res == nil || res.Text() != "secret=[redacted]" {
+		t.Fatalf("post hook result = %+v", res)
+	}
+}
+
+func TestPreToolUseHookBlocks(t *testing.T) {
+	reg := tools.NewRegistry()
+	var executed bool
+	reg.MustRegister(tools.ToolFuncMust("danger", "d", func(ctx context.Context, input json.RawMessage) (gage.ToolResult, error) {
+		executed = true
+		return gage.TextResult("", "ran"), nil
+	}))
+	mp := &mockProvider{turns: [][]gage.Event{
+		{gage.MessageStart(), toolCallDone("c1", "danger", `{}`), gage.MessageDone(gage.StopToolUse)},
+		{gage.MessageStart(), gage.TextDelta("ok"), gage.MessageDone(gage.StopEndTurn)},
+	}}
+	ag, _ := New(Config{Provider: mp, Registry: reg, Hooks: Hooks{
+		PreToolUse: func(ctx context.Context, tc gage.ToolCall) (gage.ToolCall, error) {
+			return tc, context.Canceled
+		},
+	}})
+	ch, _ := ag.Run(context.Background(), []gage.Message{gage.UserText("x")})
+	var res *gage.ToolResult
+	for e := range ch {
+		if e.Type == gage.EventToolResult {
+			res = e.ToolResult
+		}
+	}
+	if executed {
+		t.Fatal("tool ran despite blocking hook")
+	}
+	if res == nil || !res.IsError || !strings.Contains(res.Text(), "blocked by pre-tool hook") {
+		t.Fatalf("result = %+v", res)
+	}
+}
+
+func TestParallelToolExecution(t *testing.T) {
+	reg := tools.NewRegistry()
+	var mu sync.Mutex
+	inFlight, peak := 0, 0
+	block := make(chan struct{})
+	reg.MustRegister(tools.ToolFuncMust("slow", "s", func(ctx context.Context, input json.RawMessage) (gage.ToolResult, error) {
+		mu.Lock()
+		inFlight++
+		if inFlight > peak {
+			peak = inFlight
+		}
+		ready := inFlight == 2
+		mu.Unlock()
+		if ready {
+			close(block)
+		}
+		select {
+		case <-block:
+		case <-time.After(2 * time.Second):
+		}
+		mu.Lock()
+		inFlight--
+		mu.Unlock()
+		return gage.TextResult("", "ok"), nil
+	}))
+	mp := &mockProvider{turns: [][]gage.Event{
+		{
+			gage.MessageStart(),
+			toolCallDone("c1", "slow", `{}`), toolCallDone("c2", "slow", `{}`),
+			gage.MessageDone(gage.StopToolUse),
+		},
+		{gage.MessageStart(), gage.TextDelta("done"), gage.MessageDone(gage.StopEndTurn)},
+	}}
+	ag, _ := New(Config{Provider: mp, Registry: reg, MaxParallelTools: 2})
+	res, err := ag.RunSync(context.Background(), []gage.Message{gage.UserText("x")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if peak != 2 {
+		t.Fatalf("peak concurrency = %d, want 2", peak)
+	}
+	// Results must be fed back in call order regardless of completion order.
+	var callIDs []string
+	for _, m := range res.Messages {
+		if m.Role == gage.RoleTool {
+			callIDs = append(callIDs, m.Content[0].ToolResult.CallID)
+		}
+	}
+	if len(callIDs) != 2 || callIDs[0] != "c1" || callIDs[1] != "c2" {
+		t.Fatalf("call order = %v", callIDs)
+	}
+}
+
+func TestCompactionTriggered(t *testing.T) {
+	reg := tools.NewRegistry()
+	reg.MustRegister(tools.ToolFuncMust("echo", "echo", func(ctx context.Context, input json.RawMessage) (gage.ToolResult, error) {
+		return gage.TextResult("", "ok"), nil
+	}))
+	mp := &mockProvider{turns: [][]gage.Event{
+		{gage.MessageStart(), toolCallDone("c1", "echo", `{}`), gage.UsageEvent(gage.Usage{InputTokens: 5000}), gage.MessageDone(gage.StopToolUse)},
+		{gage.MessageStart(), gage.TextDelta("done"), gage.UsageEvent(gage.Usage{InputTokens: 100}), gage.MessageDone(gage.StopEndTurn)},
+	}}
+	var compacted bool
+	comp := gage.CompactorFunc(func(ctx context.Context, msgs []gage.Message, u gage.Usage) ([]gage.Message, error) {
+		compacted = true
+		if u.InputTokens != 5000 {
+			t.Errorf("compactor usage = %+v", u)
+		}
+		return msgs, nil
+	})
+	ag, _ := New(Config{Provider: mp, Registry: reg, Compactor: comp, CompactAfter: 1000})
+	if _, err := ag.RunSync(context.Background(), []gage.Message{gage.UserText("x")}); err != nil {
+		t.Fatal(err)
+	}
+	if !compacted {
+		t.Fatal("compactor not invoked past threshold")
+	}
+}
+
+func TestTrimCompactorPreservesToolPairing(t *testing.T) {
+	msgs := []gage.Message{
+		gage.UserText("task"),
+		gage.AssistantText("a1"),
+		{Role: gage.RoleAssistant, Content: []gage.ContentPart{gage.ToolUsePart(gage.ToolCall{ID: "c1", Name: "t"})}},
+		gage.ToolResultMessage(gage.TextResult("c1", "r1")),
+		gage.AssistantText("a2"),
+		gage.AssistantText("a3"),
+	}
+	// keep=3 would start the tail on the tool result; the cut must skip past it.
+	out, err := Trim(3).Compact(context.Background(), msgs, gage.Usage{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range out {
+		if m.Role == gage.RoleTool {
+			t.Fatalf("orphaned tool result in %+v", out)
+		}
+	}
+	if out[0].Text() != "task" {
+		t.Fatalf("head not preserved: %+v", out[0])
+	}
+}
+
+func TestSubAgentFailureIsErrorResult(t *testing.T) {
+	// A sub-agent whose provider errors must return an error result, not an
+	// empty success.
+	failing := &mockProvider{turns: [][]gage.Event{
+		{gage.MessageStart(), gage.ErrorEvent(gage.ErrRateLimited)},
+	}}
+	subAgent, _ := New(Config{Provider: failing, Name: "researcher"})
+	tool := subAgent.AsTool("researcher", "delegates research")
+	res, err := tool.Execute(context.Background(), json.RawMessage(`{"task":"find X"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.IsError || !strings.Contains(res.Text(), "failed") {
+		t.Fatalf("expected error result, got %+v", res)
+	}
+}
+
+func TestApproverUpdatedInput(t *testing.T) {
+	reg := tools.NewRegistry()
+	var gotInput string
+	reg.MustRegister(tools.ToolFuncMust("echo", "echo", func(ctx context.Context, input json.RawMessage) (gage.ToolResult, error) {
+		gotInput = string(input)
+		return gage.TextResult("", "ok"), nil
+	}))
+	mp := &mockProvider{turns: [][]gage.Event{
+		{gage.MessageStart(), toolCallDone("c1", "echo", `{"path":"/etc"}`), gage.MessageDone(gage.StopToolUse)},
+		{gage.MessageStart(), gage.TextDelta("done"), gage.MessageDone(gage.StopEndTurn)},
+	}}
+	approver := gage.ApproverFunc(func(ctx context.Context, r gage.PermissionRequest) (gage.Approval, error) {
+		return gage.Approval{Allow: true, UpdatedInput: json.RawMessage(`{"path":"/tmp"}`)}, nil
+	})
+	ag, _ := New(Config{Provider: mp, Registry: reg, Approver: approver})
+	if _, err := ag.RunSync(context.Background(), []gage.Message{gage.UserText("x")}); err != nil {
+		t.Fatal(err)
+	}
+	if gotInput != `{"path":"/tmp"}` {
+		t.Fatalf("tool saw input %q", gotInput)
 	}
 }

@@ -59,14 +59,7 @@ func (p *nativeProvider) pump(ctx context.Context, resp *http.Response, out chan
 	defer close(out)
 	defer resp.Body.Close()
 
-	send := func(e gage.Event) bool {
-		select {
-		case out <- e:
-			return true
-		case <-ctx.Done():
-			return false
-		}
-	}
+	send := func(e gage.Event) bool { return shared.Send(ctx, out, e) }
 	if !send(gage.MessageStart()) {
 		return
 	}
@@ -74,7 +67,7 @@ func (p *nativeProvider) pump(ctx context.Context, resp *http.Response, out chan
 	sc := bufio.NewScanner(resp.Body)
 	sc.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
 
-	stopReason := "end_turn"
+	stopReason := gage.StopEndTurn
 	toolIdx := 0
 	var usage *gage.Usage
 
@@ -115,12 +108,12 @@ func (p *nativeProvider) pump(ctx context.Context, resp *http.Response, out chan
 			if !send(gage.ToolCallDone(call)) {
 				return
 			}
-			stopReason = "tool_use"
+			stopReason = gage.StopToolUse
 		}
 		if chunk.Done {
 			usage = &gage.Usage{InputTokens: chunk.PromptEvalCount, OutputTokens: chunk.EvalCount}
 			if chunk.DoneReason == "length" {
-				stopReason = "max_tokens"
+				stopReason = gage.StopMaxTokens
 			}
 		}
 	}

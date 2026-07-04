@@ -2,9 +2,9 @@ package mcp
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"strings"
 
 	"github.com/deepteams/gage"
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
@@ -19,14 +19,13 @@ type mcpTool struct {
 	schema   gage.JSONSchema
 }
 
-func (c *Client) adapt(t *mcpsdk.Tool) gage.Tool {
-	schema := marshalSchema(t.InputSchema)
+func adaptTool(session *mcpsdk.ClientSession, server string, t *mcpsdk.Tool) gage.Tool {
 	return &mcpTool{
-		session:  c.session,
-		fullName: c.name + "__" + t.Name,
+		session:  session,
+		fullName: server + "__" + t.Name,
 		rawName:  t.Name,
 		desc:     t.Description,
-		schema:   schema,
+		schema:   marshalSchema(t.InputSchema),
 	}
 }
 
@@ -52,30 +51,48 @@ func (t *mcpTool) Execute(ctx context.Context, input json.RawMessage) (gage.Tool
 		// Protocol-level failure (tool missing, transport error): surface to model.
 		return gage.ErrorResult("", fmt.Sprintf("mcp call %s: %v", t.rawName, err)), nil
 	}
-	text := contentText(res.Content)
-	if res.IsError {
-		return gage.ErrorResult("", text), nil
-	}
-	return gage.TextResult("", text), nil
+	return gage.ToolResult{Content: contentParts(res.Content), IsError: res.IsError}, nil
 }
 
-// contentText flattens MCP content blocks into a single string. Non-text blocks
-// are rendered as their JSON for visibility.
-func contentText(content []mcpsdk.Content) string {
-	var b strings.Builder
-	for i, c := range content {
-		if i > 0 {
-			b.WriteByte('\n')
-		}
-		if tc, ok := c.(*mcpsdk.TextContent); ok {
-			b.WriteString(tc.Text)
-			continue
-		}
-		if raw, err := c.MarshalJSON(); err == nil {
-			b.Write(raw)
-		}
+// contentParts maps MCP content blocks onto gage content parts: text stays
+// text, images become PartImage, embedded resources are mapped like a resource
+// read, and anything else is rendered as its JSON for visibility.
+func contentParts(content []mcpsdk.Content) []gage.ContentPart {
+	out := make([]gage.ContentPart, 0, len(content))
+	for _, c := range content {
+		out = append(out, contentPart(c))
 	}
-	return b.String()
+	return out
+}
+
+func contentPart(c mcpsdk.Content) gage.ContentPart {
+	switch v := c.(type) {
+	case *mcpsdk.TextContent:
+		return gage.TextPart(v.Text)
+	case *mcpsdk.ImageContent:
+		return imagePart(v.Data, v.MIMEType)
+	case *mcpsdk.EmbeddedResource:
+		if v.Resource != nil {
+			return resourcePart(v.Resource)
+		}
+		return gage.TextPart("[empty embedded resource]")
+	default:
+		if raw, err := c.MarshalJSON(); err == nil {
+			return gage.TextPart(string(raw))
+		}
+		return gage.TextPart(fmt.Sprintf("[unrenderable %T content]", c))
+	}
+}
+
+// imagePart builds a PartImage from raw image bytes and their MIME type.
+func imagePart(data []byte, mimeType string) gage.ContentPart {
+	return gage.ContentPart{
+		Kind: gage.PartImage,
+		Image: &gage.ImageSource{
+			MediaType: mimeType,
+			Data:      base64.StdEncoding.EncodeToString(data),
+		},
+	}
 }
 
 // marshalSchema normalizes an MCP input schema (typically map[string]any) into

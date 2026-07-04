@@ -98,7 +98,9 @@ func (c *ChatClient) buildBody(req gage.Request) ([]byte, error) {
 	if len(req.Tools) > 0 {
 		body["tools"] = toChatTools(req.Tools)
 	}
-	applyChatOptions(body, req.Options)
+	if err := applyChatOptions(body, req.Options, c.ProviderName); err != nil {
+		return nil, err
+	}
 	maps.Copy(body, req.Options.Extra)
 	return json.Marshal(body)
 }
@@ -108,21 +110,14 @@ func (c *ChatClient) pump(ctx context.Context, resp *http.Response, out chan<- g
 	defer close(out)
 	defer resp.Body.Close()
 
-	send := func(e gage.Event) bool {
-		select {
-		case out <- e:
-			return true
-		case <-ctx.Done():
-			return false
-		}
-	}
+	send := func(e gage.Event) bool { return shared.Send(ctx, out, e) }
 
 	if !send(gage.MessageStart()) {
 		return
 	}
 
 	acc := newToolAccumulator()
-	stopReason := "stop"
+	stopReason := gage.StopEndTurn
 	var usage *gage.Usage
 
 	err := shared.ScanSSE(resp.Body, func(ev shared.SSEEvent) error {
@@ -130,6 +125,11 @@ func (c *ChatClient) pump(ctx context.Context, resp *http.Response, out chan<- g
 		if err := json.Unmarshal([]byte(ev.Data), &chunk); err != nil {
 			// Ignore keepalive/non-JSON payloads.
 			return nil
+		}
+		if chunk.Error != nil {
+			// Mid-stream {"error":{...}} payload (OpenRouter/vLLM style): the
+			// generation failed; end the stream with an error event.
+			return chunk.Error.toAPIError(c.ProviderName)
 		}
 		if chunk.Usage != nil {
 			u := chunk.Usage.toGage()
@@ -166,14 +166,18 @@ func (c *ChatClient) pump(ctx context.Context, resp *http.Response, out chan<- g
 		return nil
 	})
 
+	if err != nil {
+		// Do not flush accumulated tool calls: the stream ended mid-call and
+		// their arguments may be truncated. Emit only the error.
+		send(gage.ErrorEvent(fmt.Errorf("%s: stream: %w", c.ProviderName, err)))
+		return
+	}
+	// The Chat API signals argument completion only via stream end, so
+	// ToolCallDone events for every accumulated call are emitted here.
 	for _, e := range acc.finish() {
 		if !send(e) {
 			return
 		}
-	}
-	if err != nil {
-		send(gage.ErrorEvent(fmt.Errorf("%s: stream: %w", c.ProviderName, err)))
-		return
 	}
 	if usage != nil {
 		if !send(gage.UsageEvent(*usage)) {
@@ -183,15 +187,17 @@ func (c *ChatClient) pump(ctx context.Context, resp *http.Response, out chan<- g
 	send(gage.MessageDone(stopReason))
 }
 
-func mapFinishReason(r string) string {
+func mapFinishReason(r string) gage.StopReason {
 	switch r {
-	case "tool_calls":
-		return "tool_use"
+	case "tool_calls", "function_call":
+		return gage.StopToolUse
 	case "length":
-		return "max_tokens"
+		return gage.StopMaxTokens
 	case "stop":
-		return "end_turn"
+		return gage.StopEndTurn
+	case "content_filter":
+		return gage.StopContentFilter
 	default:
-		return r
+		return gage.StopReason(r)
 	}
 }

@@ -3,6 +3,8 @@ package agent
 import (
 	"context"
 	"time"
+
+	"github.com/deepteams/gage"
 )
 
 // ObservationType identifies a lifecycle observation emitted by an Agent.
@@ -12,6 +14,7 @@ const (
 	ObservationRunStart  ObservationType = "run_start"
 	ObservationRunEnd    ObservationType = "run_end"
 	ObservationTurnStart ObservationType = "turn_start"
+	ObservationTurnEnd   ObservationType = "turn_end"
 	ObservationToolStart ObservationType = "tool_start"
 	ObservationToolEnd   ObservationType = "tool_end"
 )
@@ -31,6 +34,8 @@ type Observation struct {
 	Duration    time.Duration
 	IsError     bool
 	ErrorString string
+	// Usage is the provider-reported token usage of the turn (turn_end only).
+	Usage gage.Usage
 }
 
 // Observer consumes structured Agent lifecycle observations.

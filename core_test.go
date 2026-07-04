@@ -58,7 +58,7 @@ func TestEventConstructors(t *testing.T) {
 	if got := ToolCallStart(tc); got.ToolCall == nil || got.ToolCall.Name != "bash" {
 		t.Fatalf("ToolCallStart = %+v", got)
 	}
-	if EventDone != DoneEvent().Type {
+	if EventDone != DoneEvent(nil).Type {
 		t.Fatal("DoneEvent type")
 	}
 	if got := TextDelta("x").WithTurn(3); got.Turn != 3 {

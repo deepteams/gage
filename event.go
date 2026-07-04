@@ -12,6 +12,10 @@ const (
 	EventTextDelta EventType = "text_delta"
 	// EventReasoningDelta carries a chunk of reasoning/thinking text.
 	EventReasoningDelta EventType = "reasoning_delta"
+	// EventReasoningDone closes a reasoning block. Signature carries the
+	// provider's opaque replay token for the block, when one exists. Providers
+	// that stream reasoning without block boundaries may omit this event.
+	EventReasoningDone EventType = "reasoning_done"
 	// EventToolCallStart signals a tool call has begun; ToolCall has ID+Name.
 	EventToolCallStart EventType = "tool_call_start"
 	// EventToolCallDelta carries a partial chunk of the tool call arguments;
@@ -45,8 +49,14 @@ type Event struct {
 	ToolResult *ToolResult `json:"tool_result,omitempty"`
 	// Usage is set for EventUsage.
 	Usage *Usage `json:"usage,omitempty"`
-	// StopReason is set for EventMessageDone ("end_turn","tool_use","max_tokens","stop").
-	StopReason string `json:"stop_reason,omitempty"`
+	// StopReason is set for EventMessageDone.
+	StopReason StopReason `json:"stop_reason,omitempty"`
+	// Signature is set for EventReasoningDone when the provider requires the
+	// reasoning block to be replayed with an opaque token.
+	Signature string `json:"signature,omitempty"`
+	// Result summarizes the whole run. It is set on the terminal EventDone
+	// emitted by an agent (never by raw providers).
+	Result *Result `json:"result,omitempty"`
 	// Err is set for EventError. It is not serialized directly; use ErrorString.
 	Err error `json:"-"`
 	// ErrorString mirrors Err for JSON transports.
@@ -62,6 +72,12 @@ func TextDelta(s string) Event { return Event{Type: EventTextDelta, Text: s} }
 
 // ReasoningDelta builds an EventReasoningDelta.
 func ReasoningDelta(s string) Event { return Event{Type: EventReasoningDelta, Text: s} }
+
+// ReasoningDone builds an EventReasoningDone carrying the block's replay
+// signature (may be empty).
+func ReasoningDone(signature string) Event {
+	return Event{Type: EventReasoningDone, Signature: signature}
+}
 
 // MessageStart builds an EventMessageStart.
 func MessageStart() Event { return Event{Type: EventMessageStart} }
@@ -82,7 +98,7 @@ func ToolResultEvent(tr ToolResult) Event { return Event{Type: EventToolResult, 
 func UsageEvent(u Usage) Event { return Event{Type: EventUsage, Usage: &u} }
 
 // MessageDone builds an EventMessageDone.
-func MessageDone(stopReason string) Event {
+func MessageDone(stopReason StopReason) Event {
 	return Event{Type: EventMessageDone, StopReason: stopReason}
 }
 
@@ -95,8 +111,8 @@ func ErrorEvent(err error) Event {
 	return Event{Type: EventError, Err: err, ErrorString: msg}
 }
 
-// DoneEvent builds an EventDone.
-func DoneEvent() Event { return Event{Type: EventDone} }
+// DoneEvent builds an EventDone carrying the run summary.
+func DoneEvent(res *Result) Event { return Event{Type: EventDone, Result: res} }
 
 // WithTurn returns a copy of the event tagged with the given loop turn.
 func (e Event) WithTurn(turn int) Event {

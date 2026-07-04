@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/deepteams/gage"
@@ -49,14 +50,24 @@ func (a *Agent) runLoop(ctx context.Context, input []gage.Message, out chan<- ga
 		schemas = a.cfg.Registry.Schemas()
 	}
 
+	var runUsage gage.Usage
+	var lastText string
+	var lastStop gage.StopReason
+
+	fail := func(turn int, err error) {
+		runErr = err.Error()
+		send(gage.ErrorEvent(err).WithTurn(turn))
+	}
+
 	for turn := 0; turn < a.cfg.maxTurns(); turn++ {
+		turnStarted := time.Now()
 		a.observe(ctx, Observation{
 			Type:      ObservationTurnStart,
 			RunID:     runID,
 			Agent:     a.cfg.Name,
 			Provider:  a.cfg.Provider.Name(),
 			Turn:      turn,
-			StartedAt: time.Now(),
+			StartedAt: turnStarted,
 		})
 		req := gage.Request{
 			Model:    a.cfg.Model,
@@ -65,11 +76,16 @@ func (a *Agent) runLoop(ctx context.Context, input []gage.Message, out chan<- ga
 			System:   a.cfg.systemPrompt(),
 			Options:  a.cfg.Options,
 		}
+		if a.cfg.Hooks.PrepareRequest != nil {
+			if err := a.cfg.Hooks.PrepareRequest(ctx, &req); err != nil {
+				fail(turn, fmt.Errorf("prepare request hook: %w", err))
+				return
+			}
+		}
 
 		stream, err := a.cfg.Provider.Stream(ctx, req)
 		if err != nil {
-			runErr = err.Error()
-			send(gage.ErrorEvent(err).WithTurn(turn))
+			fail(turn, err)
 			return
 		}
 
@@ -79,27 +95,59 @@ func (a *Agent) runLoop(ctx context.Context, input []gage.Message, out chan<- ga
 			runErr = streamErr.Error()
 			return
 		}
-		conversation = append(conversation, asst.message())
+		runUsage = runUsage.Add(asst.usage)
+		lastStop = asst.stopReason
+		if t := asst.text(); t != "" {
+			lastText = t
+		}
+		a.observe(ctx, Observation{
+			Type:      ObservationTurnEnd,
+			RunID:     runID,
+			Agent:     a.cfg.Name,
+			Provider:  a.cfg.Provider.Name(),
+			Turn:      turn,
+			StartedAt: turnStarted,
+			Duration:  time.Since(turnStarted),
+			Usage:     asst.usage,
+		})
+
+		if msg, ok := asst.message(); ok {
+			conversation = append(conversation, msg)
+		}
 
 		if len(asst.toolCalls) == 0 {
-			send(gage.DoneEvent().WithTurn(turn))
+			res := &gage.Result{
+				Messages:   conversation,
+				Text:       lastText,
+				StopReason: lastStop,
+				Usage:      runUsage,
+				Turns:      turn + 1,
+			}
+			send(gage.DoneEvent(res).WithTurn(turn))
 			return
 		}
 
 		// Execute the requested tool calls and feed results back.
-		for _, tc := range asst.toolCalls {
+		results, ok := a.execTools(ctx, runID, turn, asst.toolCalls, send)
+		if !ok {
 			if ctx.Err() != nil {
 				runErr = ctx.Err().Error()
-				return
 			}
-			result := a.execTool(ctx, runID, turn, tc)
-			if !send(gage.ToolResultEvent(result).WithTurn(turn)) {
-				if ctx.Err() != nil {
-					runErr = ctx.Err().Error()
-				}
-				return
-			}
+			return
+		}
+		for _, result := range results {
 			conversation = append(conversation, gage.ToolResultMessage(result))
+		}
+
+		// Compact the conversation when the input side of the context window
+		// crosses the configured threshold.
+		if a.cfg.Compactor != nil && a.cfg.CompactAfter > 0 && asst.usage.InputTokens >= a.cfg.CompactAfter {
+			compacted, err := a.cfg.Compactor.Compact(ctx, conversation, asst.usage)
+			if err != nil {
+				fail(turn, fmt.Errorf("compaction: %w", err))
+				return
+			}
+			conversation = compacted
 		}
 	}
 
@@ -107,37 +155,101 @@ func (a *Agent) runLoop(ctx context.Context, input []gage.Message, out chan<- ga
 	send(gage.ErrorEvent(gage.ErrMaxTurns).WithTurn(a.cfg.maxTurns()))
 }
 
-// assistantAccum reconstructs an assistant message from a provider stream.
+// assistantAccum reconstructs an assistant message from a provider stream,
+// preserving the order of reasoning, text, and tool-use blocks.
 type assistantAccum struct {
-	text      string
-	toolCalls []gage.ToolCall
+	parts      []gage.ContentPart
+	openKind   gage.PartKind // PartText or PartReasoning while a run of deltas is open
+	openText   string
+	toolCalls  []gage.ToolCall
+	usage      gage.Usage
+	stopReason gage.StopReason
 }
 
-func (acc assistantAccum) message() gage.Message {
-	content := make([]gage.ContentPart, 0, 1+len(acc.toolCalls))
-	if acc.text != "" {
-		content = append(content, gage.TextPart(acc.text))
+// flush closes the currently open delta run into a part.
+func (acc *assistantAccum) flush(signature string) {
+	if acc.openText == "" && signature == "" {
+		acc.openKind = ""
+		return
 	}
+	switch acc.openKind {
+	case gage.PartReasoning:
+		acc.parts = append(acc.parts, gage.SignedReasoningPart(acc.openText, signature))
+	case gage.PartText:
+		acc.parts = append(acc.parts, gage.TextPart(acc.openText))
+	}
+	acc.openKind = ""
+	acc.openText = ""
+}
+
+// delta appends streamed text of the given kind, flushing when the kind changes.
+func (acc *assistantAccum) delta(kind gage.PartKind, s string) {
+	if acc.openKind != kind {
+		acc.flush("")
+		acc.openKind = kind
+	}
+	acc.openText += s
+}
+
+func (acc *assistantAccum) text() string {
+	var s string
+	for _, p := range acc.parts {
+		if p.Kind == gage.PartText {
+			s += p.Text
+		}
+	}
+	if acc.openKind == gage.PartText {
+		s += acc.openText
+	}
+	return s
+}
+
+// message returns the reconstructed assistant message. ok is false when the
+// stream produced no content at all (some providers reject empty assistant
+// messages, so the loop skips them).
+func (acc *assistantAccum) message() (gage.Message, bool) {
+	acc.flush("")
+	content := append([]gage.ContentPart(nil), acc.parts...)
 	for _, tc := range acc.toolCalls {
 		content = append(content, gage.ToolUsePart(tc))
 	}
-	return gage.Message{Role: gage.RoleAssistant, Content: content}
+	if len(content) == 0 {
+		return gage.Message{}, false
+	}
+	return gage.Message{Role: gage.RoleAssistant, Content: content}, true
 }
 
 // consume relays provider events (tagged with turn) and accumulates the
 // assistant message. It returns a non-nil error if the stream errored or ctx
 // was cancelled, in which case an error event has already been forwarded (for
 // stream errors) — the caller should stop.
-func (a *Agent) consume(ctx context.Context, turn int, stream <-chan gage.Event, send func(gage.Event) bool) (assistantAccum, error) {
-	var acc assistantAccum
+func (a *Agent) consume(ctx context.Context, turn int, stream <-chan gage.Event, send func(gage.Event) bool) (*assistantAccum, error) {
+	acc := &assistantAccum{}
 	for ev := range stream {
 		switch ev.Type {
 		case gage.EventTextDelta:
-			acc.text += ev.Text
+			acc.delta(gage.PartText, ev.Text)
+		case gage.EventReasoningDelta:
+			acc.delta(gage.PartReasoning, ev.Text)
+		case gage.EventReasoningDone:
+			// Close the reasoning block, attaching the provider's replay
+			// signature so the block survives the round-trip.
+			if acc.openKind != gage.PartReasoning {
+				acc.flush("")
+				acc.openKind = gage.PartReasoning
+			}
+			acc.flush(ev.Signature)
 		case gage.EventToolCallDone:
 			if ev.ToolCall != nil {
+				acc.flush("")
 				acc.toolCalls = append(acc.toolCalls, *ev.ToolCall)
 			}
+		case gage.EventUsage:
+			if ev.Usage != nil {
+				acc.usage = *ev.Usage
+			}
+		case gage.EventMessageDone:
+			acc.stopReason = ev.StopReason
 		case gage.EventError:
 			send(ev.WithTurn(turn))
 			return acc, errStreamFailed
@@ -152,9 +264,57 @@ func (a *Agent) consume(ctx context.Context, turn int, stream <-chan gage.Event,
 	return acc, nil
 }
 
-// execTool runs a single tool call through the registry and optional approver,
-// always returning a ToolResult (errors are reported to the model, not the
-// caller).
+// execTools runs a turn's tool calls — sequentially by default, concurrently
+// when Config.MaxParallelTools > 1 — emitting each tool_result event as it
+// completes. The returned slice is ordered like calls so the conversation
+// stays deterministic. ok is false when ctx was cancelled mid-way.
+func (a *Agent) execTools(ctx context.Context, runID string, turn int, calls []gage.ToolCall, send func(gage.Event) bool) ([]gage.ToolResult, bool) {
+	parallel := a.cfg.MaxParallelTools
+	if parallel <= 1 || len(calls) == 1 {
+		results := make([]gage.ToolResult, 0, len(calls))
+		for _, tc := range calls {
+			if ctx.Err() != nil {
+				return nil, false
+			}
+			result := a.execTool(ctx, runID, turn, tc)
+			if !send(gage.ToolResultEvent(result).WithTurn(turn)) {
+				return nil, false
+			}
+			results = append(results, result)
+		}
+		return results, true
+	}
+
+	results := make([]gage.ToolResult, len(calls))
+	sem := make(chan struct{}, parallel)
+	var wg sync.WaitGroup
+	var sendMu sync.Mutex
+	cancelled := false
+	for i, tc := range calls {
+		wg.Add(1)
+		go func(i int, tc gage.ToolCall) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			result := a.execTool(ctx, runID, turn, tc)
+			results[i] = result
+			sendMu.Lock()
+			defer sendMu.Unlock()
+			if !send(gage.ToolResultEvent(result).WithTurn(turn)) {
+				cancelled = true
+			}
+		}(i, tc)
+	}
+	wg.Wait()
+	if cancelled || ctx.Err() != nil {
+		return nil, false
+	}
+	return results, true
+}
+
+// execTool runs a single tool call through the hooks, registry and optional
+// approver, always returning a ToolResult (errors are reported to the model,
+// not the caller).
 func (a *Agent) execTool(ctx context.Context, runID string, turn int, tc gage.ToolCall) (res gage.ToolResult) {
 	started := time.Now()
 	a.observe(ctx, Observation{
@@ -170,6 +330,9 @@ func (a *Agent) execTool(ctx context.Context, runID string, turn int, tc gage.To
 	defer func() {
 		if r := recover(); r != nil {
 			res = gage.ErrorResult(tc.ID, fmt.Sprintf("tool panic: %v", r))
+		}
+		if a.cfg.Hooks.PostToolUse != nil {
+			res = a.cfg.Hooks.PostToolUse(ctx, tc, res)
 		}
 		if res.CallID == "" {
 			res.CallID = tc.ID
@@ -199,8 +362,16 @@ func (a *Agent) execTool(ctx context.Context, runID string, turn int, tc gage.To
 	if !ok {
 		return gage.ErrorResult(tc.ID, "unknown tool: "+tc.Name)
 	}
+	if a.cfg.Hooks.PreToolUse != nil {
+		updated, err := a.cfg.Hooks.PreToolUse(ctx, tc)
+		if err != nil {
+			return gage.ErrorResult(tc.ID, "blocked by pre-tool hook: "+err.Error())
+		}
+		updated.ID, updated.Name = tc.ID, tc.Name // hooks may only rewrite the input
+		tc = updated
+	}
 	if a.cfg.Approver != nil {
-		decision, err := a.cfg.Approver.Approve(ctx, gage.PermissionRequest{
+		approval, err := a.cfg.Approver.Approve(ctx, gage.PermissionRequest{
 			Tool:     tc.Name,
 			Input:    tc.Input,
 			Agent:    a.cfg.Name,
@@ -212,8 +383,15 @@ func (a *Agent) execTool(ctx context.Context, runID string, turn int, tc gage.To
 		if err != nil {
 			return gage.ErrorResult(tc.ID, "permission check failed: "+err.Error())
 		}
-		if decision == gage.Deny {
-			return gage.ErrorResult(tc.ID, "permission denied for tool "+tc.Name)
+		if !approval.Allow {
+			msg := "permission denied for tool " + tc.Name
+			if approval.Reason != "" {
+				msg += ": " + approval.Reason
+			}
+			return gage.ErrorResult(tc.ID, msg)
+		}
+		if approval.UpdatedInput != nil {
+			tc.Input = approval.UpdatedInput
 		}
 	}
 

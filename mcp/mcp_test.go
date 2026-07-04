@@ -2,8 +2,11 @@ package mcp
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"sync"
 	"testing"
 
 	"github.com/deepteams/gage"
@@ -59,12 +62,66 @@ func TestMCPDiscoveryAndCall(t *testing.T) {
 	}
 
 	// Registration into a gage registry works.
-	reg := &fakeRegistry{tools: map[string]gage.Tool{}}
+	reg := newFakeRegistry()
 	if err := c.Register(ctx, reg); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := reg.tools["calc__add"]; !ok {
+	if _, ok := reg.Get("calc__add"); !ok {
 		t.Fatal("tool not registered")
+	}
+}
+
+func TestImageToolResult(t *testing.T) {
+	ctx := context.Background()
+	png := []byte{0x89, 'P', 'N', 'G', 1, 2, 3}
+
+	server := mcpsdk.NewServer(&mcpsdk.Implementation{Name: "pix", Version: "1.0"}, nil)
+	mcpsdk.AddTool(server, &mcpsdk.Tool{Name: "shot", Description: "screenshot"},
+		func(ctx context.Context, req *mcpsdk.CallToolRequest, in struct{}) (*mcpsdk.CallToolResult, any, error) {
+			return &mcpsdk.CallToolResult{
+				Content: []mcpsdk.Content{
+					&mcpsdk.TextContent{Text: "here you go"},
+					&mcpsdk.ImageContent{Data: png, MIMEType: "image/png"},
+				},
+			}, nil, nil
+		})
+
+	clientT, serverT := mcpsdk.NewInMemoryTransports()
+	if _, err := server.Connect(ctx, serverT, nil); err != nil {
+		t.Fatal(err)
+	}
+	c, err := connect(ctx, "pix", clientT)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	tools, err := c.Tools(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := tools[0].Execute(ctx, json.RawMessage(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.IsError {
+		t.Fatalf("unexpected error result: %+v", res)
+	}
+	if len(res.Content) != 2 {
+		t.Fatalf("expected 2 parts, got %d: %+v", len(res.Content), res.Content)
+	}
+	if res.Content[0].Kind != gage.PartText || res.Content[0].Text != "here you go" {
+		t.Fatalf("part 0 = %+v", res.Content[0])
+	}
+	img := res.Content[1]
+	if img.Kind != gage.PartImage || img.Image == nil {
+		t.Fatalf("part 1 = %+v", img)
+	}
+	if img.Image.MediaType != "image/png" {
+		t.Fatalf("media type = %q", img.Image.MediaType)
+	}
+	if img.Image.Data != base64.StdEncoding.EncodeToString(png) {
+		t.Fatalf("image data = %q", img.Image.Data)
 	}
 }
 
@@ -85,14 +142,53 @@ func (r *recordingTransport) RoundTrip(req *http.Request) (*http.Response, error
 	return &http.Response{StatusCode: 200, Body: http.NoBody, Header: make(http.Header)}, nil
 }
 
-type fakeRegistry struct{ tools map[string]gage.Tool }
+// fakeRegistry is a minimal, concurrency-safe gage.ToolRegistry for tests. It
+// must be safe because tool-sync reconciliation runs on notification handler
+// goroutines.
+type fakeRegistry struct {
+	mu    sync.Mutex
+	tools map[string]gage.Tool
+}
 
-func (r *fakeRegistry) Register(t gage.Tool) error { r.tools[t.Name()] = t; return nil }
+func newFakeRegistry() *fakeRegistry {
+	return &fakeRegistry{tools: map[string]gage.Tool{}}
+}
+
+func (r *fakeRegistry) Register(t gage.Tool) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.tools[t.Name()]; ok {
+		return fmt.Errorf("duplicate tool %s", t.Name())
+	}
+	r.tools[t.Name()] = t
+	return nil
+}
+
+func (r *fakeRegistry) Unregister(name string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	_, ok := r.tools[name]
+	delete(r.tools, name)
+	return ok
+}
+
 func (r *fakeRegistry) Get(n string) (gage.Tool, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	t, ok := r.tools[n]
 	return t, ok
 }
-func (r *fakeRegistry) List() []gage.Tool          { return nil }
+
+func (r *fakeRegistry) List() []gage.Tool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]gage.Tool, 0, len(r.tools))
+	for _, t := range r.tools {
+		out = append(out, t)
+	}
+	return out
+}
+
 func (r *fakeRegistry) Schemas() []gage.ToolSchema { return nil }
 
 func itoa(n int) string {

@@ -3,6 +3,7 @@ package openai
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -99,7 +100,7 @@ func TestResponsesStreamToolCall(t *testing.T) {
 		t.Fatal(err)
 	}
 	var start, done *gage.ToolCall
-	var stop string
+	var stop gage.StopReason
 	for e := range ch {
 		switch e.Type {
 		case gage.EventToolCallStart:
@@ -116,8 +117,118 @@ func TestResponsesStreamToolCall(t *testing.T) {
 	if done == nil || string(done.Input) != `{"pattern":"foo"}` {
 		t.Fatalf("done = %+v", done)
 	}
-	if stop != "tool_use" {
+	if stop != gage.StopToolUse {
 		t.Fatalf("stop = %q", stop)
+	}
+}
+
+func TestResponsesReasoningEncryptedContent(t *testing.T) {
+	events := [][2]string{
+		{"response.reasoning_text.delta", `{"delta":"think"}`},
+		{"response.output_item.done", `{"item":{"type":"reasoning","id":"rs_1","encrypted_content":"enc-token-xyz"}}`},
+		{"response.output_text.delta", `{"delta":"done"}`},
+		{"response.completed", `{"response":{"usage":{"input_tokens":1,"output_tokens":1}}}`},
+	}
+	var reqBody []byte
+	srv := namedSSEServer(t, events, &reqBody)
+
+	c := &ResponsesClient{ProviderName: "codex", URL: srv.URL, DefaultModel: "gpt", Store: false}
+	ch, err := c.Stream(context.Background(), gage.Request{
+		Messages: []gage.Message{gage.UserText("hi")},
+		Options:  gage.GenerateOptions{ReasoningEffort: gage.ReasoningMedium},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sig string
+	for e := range ch {
+		if e.Type == gage.EventReasoningDone {
+			sig = e.Signature
+		}
+	}
+	if sig != "enc-token-xyz" {
+		t.Fatalf("signature = %q", sig)
+	}
+
+	// The request must ask for the encrypted content when reasoning is in
+	// play and store is false.
+	var body map[string]any
+	json.Unmarshal(reqBody, &body)
+	inc, _ := body["include"].([]any)
+	if len(inc) != 1 || inc[0] != "reasoning.encrypted_content" {
+		t.Fatalf("include = %v", body["include"])
+	}
+}
+
+func TestResponsesReasoningReplay(t *testing.T) {
+	input := toResponsesInput([]gage.Message{
+		gage.UserText("q"),
+		{Role: gage.RoleAssistant, Content: []gage.ContentPart{
+			gage.SignedReasoningPart("thought", "enc-abc"),
+			gage.ToolUsePart(gage.ToolCall{ID: "call_1", Name: "grep", Input: gage.JSONSchema(`{"p":1}`)}),
+		}},
+	})
+	if len(input) != 3 {
+		t.Fatalf("input = %v", input)
+	}
+	// The reasoning item must precede the function_call of the same turn.
+	if input[1]["type"] != "reasoning" || input[1]["encrypted_content"] != "enc-abc" {
+		t.Fatalf("reasoning item = %v", input[1])
+	}
+	if input[2]["type"] != "function_call" {
+		t.Fatalf("function_call item = %v", input[2])
+	}
+	// Unsigned reasoning parts are skipped.
+	input = toResponsesInput([]gage.Message{
+		{Role: gage.RoleAssistant, Content: []gage.ContentPart{gage.ReasoningPart("no token")}},
+	})
+	if len(input) != 0 {
+		t.Fatalf("unsigned reasoning must be skipped: %v", input)
+	}
+}
+
+func TestResponsesToolChoiceAndFormat(t *testing.T) {
+	events := [][2]string{{"response.completed", `{"response":{}}`}}
+	var reqBody []byte
+	srv := namedSSEServer(t, events, &reqBody)
+	c := &ResponsesClient{ProviderName: "codex", URL: srv.URL, DefaultModel: "gpt"}
+	tc := gage.ToolChoice{Mode: gage.ToolChoiceTool, Name: "grep"}
+	ch, err := c.Stream(context.Background(), gage.Request{
+		Messages: []gage.Message{gage.UserText("hi")},
+		Options: gage.GenerateOptions{
+			ToolChoice: &tc,
+			ResponseFormat: &gage.ResponseFormat{
+				Type: gage.ResponseJSONSchema, Name: "out",
+				Schema: gage.JSONSchema(`{"type":"object"}`), Strict: true,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range ch {
+	}
+	var body map[string]any
+	json.Unmarshal(reqBody, &body)
+	choice, _ := body["tool_choice"].(map[string]any)
+	if choice == nil || choice["type"] != "function" || choice["name"] != "grep" {
+		t.Fatalf("tool_choice = %v", body["tool_choice"])
+	}
+	text, _ := body["text"].(map[string]any)
+	format, _ := text["format"].(map[string]any)
+	if format == nil || format["type"] != "json_schema" || format["name"] != "out" || format["strict"] != true {
+		t.Fatalf("text.format = %v", text)
+	}
+}
+
+func TestResponsesStopSequencesUnsupported(t *testing.T) {
+	c := &ResponsesClient{ProviderName: "codex", URL: "http://127.0.0.1:0", DefaultModel: "gpt"}
+	_, err := c.Stream(context.Background(), gage.Request{
+		Messages: []gage.Message{gage.UserText("hi")},
+		Options:  gage.GenerateOptions{StopSequences: []string{"STOP"}},
+	})
+	if !errors.Is(err, gage.ErrUnsupported) {
+		t.Fatalf("err = %v, want ErrUnsupported", err)
 	}
 }
 

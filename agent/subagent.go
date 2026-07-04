@@ -4,10 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"strings"
 
 	"github.com/deepteams/gage"
-	"github.com/deepteams/gage/internal/jsonschema"
+	"github.com/deepteams/gage/jsonschema"
 )
 
 // AsTool exposes the agent as a gage.Tool, enabling sub-agent delegation: a
@@ -53,34 +52,11 @@ func (t *subAgentTool) Execute(ctx context.Context, input json.RawMessage) (gage
 	if err := json.Unmarshal(input, &args); err != nil {
 		return gage.ToolResult{}, err
 	}
-	stream, err := t.agent.Run(ctx, []gage.Message{gage.UserText(args.Task)})
+	res, err := t.agent.RunSync(ctx, []gage.Message{gage.UserText(args.Task)})
 	if err != nil {
-		return gage.ErrorResult("", err.Error()), nil
+		// A failed, cancelled, or timed-out sub-agent must surface as an
+		// error result, never as an empty success.
+		return gage.ErrorResult("", fmt.Sprintf("sub-agent %s failed: %v", t.name, err)), nil
 	}
-
-	var current strings.Builder
-	var final string
-	var haveFinal bool
-	var lastErr string
-	for ev := range stream {
-		switch ev.Type {
-		case gage.EventMessageStart:
-			current.Reset()
-		case gage.EventTextDelta:
-			current.WriteString(ev.Text)
-		case gage.EventMessageDone:
-			if ev.StopReason != "tool_use" {
-				final = current.String()
-				haveFinal = true
-			}
-		case gage.EventError:
-			if ev.ErrorString != "" {
-				lastErr = ev.ErrorString
-			}
-		}
-	}
-	if !haveFinal && lastErr != "" {
-		return gage.ErrorResult("", lastErr), nil
-	}
-	return gage.TextResult("", final), nil
+	return gage.TextResult("", res.Text), nil
 }

@@ -6,7 +6,7 @@ import (
 	"fmt"
 
 	"github.com/deepteams/gage"
-	"github.com/deepteams/gage/internal/jsonschema"
+	"github.com/deepteams/gage/jsonschema"
 )
 
 // NewTool returns the "skill" tool, which loads a named skill's full

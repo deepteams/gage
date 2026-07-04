@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/deepteams/gage"
+	"github.com/deepteams/gage/providers/shared"
 )
 
 // collectEvents drains a stream into a slice.
@@ -84,7 +85,7 @@ func TestChatStreamText(t *testing.T) {
 	var text strings.Builder
 	var types []gage.EventType
 	var usage *gage.Usage
-	var stop string
+	var stop gage.StopReason
 	for _, e := range events {
 		types = append(types, e.Type)
 		switch e.Type {
@@ -102,7 +103,7 @@ func TestChatStreamText(t *testing.T) {
 	if usage == nil || usage.InputTokens != 5 || usage.OutputTokens != 2 {
 		t.Fatalf("usage = %+v", usage)
 	}
-	if stop != "end_turn" {
+	if stop != gage.StopEndTurn {
 		t.Fatalf("stop = %q", stop)
 	}
 	if types[0] != gage.EventMessageStart || types[len(types)-1] != gage.EventMessageDone {
@@ -126,7 +127,7 @@ func TestChatStreamToolCall(t *testing.T) {
 	events := collectEvents(t, ch)
 
 	var start, done *gage.ToolCall
-	var stop string
+	var stop gage.StopReason
 	for _, e := range events {
 		switch e.Type {
 		case gage.EventToolCallStart:
@@ -143,8 +144,148 @@ func TestChatStreamToolCall(t *testing.T) {
 	if done == nil || string(done.Input) != `{"path":"a.txt"}` {
 		t.Fatalf("done input = %s", done.Input)
 	}
-	if stop != "tool_use" {
+	if stop != gage.StopToolUse {
 		t.Fatalf("stop = %q", stop)
+	}
+}
+
+func TestChatMidStreamError(t *testing.T) {
+	// OpenRouter/vLLM report failures as an {"error":{...}} SSE payload.
+	chunks := []string{
+		`{"choices":[{"delta":{"content":"partial"}}]}`,
+		`{"error":{"message":"rate limited","code":429}}`,
+	}
+	srv := sseServer(t, chunks, nil)
+	c := &ChatClient{ProviderName: "test", BaseURL: srv.URL, DefaultModel: "m"}
+	ch, err := c.Stream(context.Background(), gage.Request{Messages: []gage.Message{gage.UserText("hi")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := collectEvents(t, ch)
+	last := events[len(events)-1]
+	if last.Type != gage.EventError {
+		t.Fatalf("last event = %+v, want error", last)
+	}
+	var apiErr *gage.APIError
+	if !errors.As(last.Err, &apiErr) || apiErr.Status != 429 {
+		t.Fatalf("err = %v", last.Err)
+	}
+	if !errors.Is(last.Err, gage.ErrRateLimited) {
+		t.Fatalf("err should match ErrRateLimited: %v", last.Err)
+	}
+	for _, e := range events {
+		if e.Type == gage.EventMessageDone {
+			t.Fatalf("stream must not complete after an error: %v", events)
+		}
+	}
+}
+
+func TestChatTruncatedToolCallNotFlushed(t *testing.T) {
+	// The stream dies mid tool-call: no ToolCallDone may be emitted for the
+	// incomplete call, only the error.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		// Announce more bytes than are written so the client sees an
+		// unexpected EOF mid-stream.
+		w.Header().Set("Content-Length", "4096")
+		io.WriteString(w, "data: "+`{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"write_file","arguments":"{\"path\":\"a.txt\",\"content\":\"trunc"}}]}}]}`+"\n\n")
+	}))
+	t.Cleanup(srv.Close)
+
+	c := &ChatClient{ProviderName: "test", BaseURL: srv.URL, DefaultModel: "m", HTTP: noRetryClient()}
+	ch, err := c.Stream(context.Background(), gage.Request{Messages: []gage.Message{gage.UserText("hi")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := collectEvents(t, ch)
+	var sawErr bool
+	for _, e := range events {
+		switch e.Type {
+		case gage.EventToolCallDone:
+			t.Fatalf("truncated call must not be completed: %+v", e.ToolCall)
+		case gage.EventMessageDone:
+			t.Fatalf("stream must not complete: %v", events)
+		case gage.EventError:
+			sawErr = true
+		}
+	}
+	if !sawErr {
+		t.Fatalf("expected an error event, got %v", events)
+	}
+}
+
+func noRetryClient() *shared.Client {
+	c := shared.NewClient("test")
+	c.MaxRetries = 0
+	return c
+}
+
+func TestChatResponseFormatMapping(t *testing.T) {
+	chunks := []string{`{"choices":[{"delta":{"content":"{}"},"finish_reason":"stop"}]}`}
+
+	t.Run("json_object", func(t *testing.T) {
+		var reqBody []byte
+		srv := sseServer(t, chunks, &reqBody)
+		c := &ChatClient{ProviderName: "test", BaseURL: srv.URL, DefaultModel: "m"}
+		ch, err := c.Stream(context.Background(), gage.Request{
+			Messages: []gage.Message{gage.UserText("hi")},
+			Options:  gage.GenerateOptions{ResponseFormat: &gage.ResponseFormat{Type: gage.ResponseJSON}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		collectEvents(t, ch)
+		var body map[string]any
+		json.Unmarshal(reqBody, &body)
+		rf, _ := body["response_format"].(map[string]any)
+		if rf == nil || rf["type"] != "json_object" {
+			t.Fatalf("response_format = %v", body["response_format"])
+		}
+	})
+
+	t.Run("json_schema", func(t *testing.T) {
+		var reqBody []byte
+		srv := sseServer(t, chunks, &reqBody)
+		c := &ChatClient{ProviderName: "test", BaseURL: srv.URL, DefaultModel: "m"}
+		schema := gage.JSONSchema(`{"type":"object","properties":{"x":{"type":"integer"}}}`)
+		ch, err := c.Stream(context.Background(), gage.Request{
+			Messages: []gage.Message{gage.UserText("hi")},
+			Options: gage.GenerateOptions{ResponseFormat: &gage.ResponseFormat{
+				Type: gage.ResponseJSONSchema, Name: "out", Schema: schema, Strict: true,
+			}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		collectEvents(t, ch)
+		var body map[string]any
+		json.Unmarshal(reqBody, &body)
+		rf, _ := body["response_format"].(map[string]any)
+		if rf == nil || rf["type"] != "json_schema" {
+			t.Fatalf("response_format = %v", body["response_format"])
+		}
+		js, _ := rf["json_schema"].(map[string]any)
+		if js == nil || js["name"] != "out" || js["strict"] != true || js["schema"] == nil {
+			t.Fatalf("json_schema = %v", js)
+		}
+	})
+}
+
+func TestChatAssistantMessageNeverEmpty(t *testing.T) {
+	// An assistant history message with only reasoning parts must not encode
+	// as a bare {"role":"assistant"}; it falls back to empty string content.
+	msgs := toChatMessages("", []gage.Message{
+		{Role: gage.RoleAssistant, Content: []gage.ContentPart{gage.ReasoningPart("thinking...")}},
+	})
+	if len(msgs) != 1 {
+		t.Fatalf("msgs = %v", msgs)
+	}
+	content, ok := msgs[0]["content"]
+	if !ok || content != "" {
+		t.Fatalf("content = %v (present=%v), want empty string", content, ok)
+	}
+	if _, ok := msgs[0]["tool_calls"]; ok {
+		t.Fatalf("unexpected tool_calls: %v", msgs[0])
 	}
 }
 

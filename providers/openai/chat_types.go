@@ -34,6 +34,8 @@ func toChatMessages(system string, msgs []gage.Message) []map[string]any {
 				switch p.Kind {
 				case gage.PartText:
 					text += p.Text
+				case gage.PartReasoning:
+					// Skipped: Chat Completions has no reasoning replay mechanism.
 				case gage.PartToolUse:
 					if p.ToolCall != nil {
 						toolCalls = append(toolCalls, map[string]any{
@@ -47,11 +49,13 @@ func toChatMessages(system string, msgs []gage.Message) []map[string]any {
 					}
 				}
 			}
-			if text != "" {
-				msg["content"] = text
-			}
 			if len(toolCalls) > 0 {
 				msg["tool_calls"] = toolCalls
+			}
+			// Never emit an assistant message with neither content nor
+			// tool_calls (many servers reject it); fall back to "" content.
+			if text != "" || len(toolCalls) == 0 {
+				msg["content"] = text
 			}
 			out = append(out, msg)
 		default:
@@ -113,7 +117,7 @@ func toChatTools(tools []gage.ToolSchema) []map[string]any {
 	return out
 }
 
-func applyChatOptions(body map[string]any, o gage.GenerateOptions) {
+func applyChatOptions(body map[string]any, o gage.GenerateOptions, provider string) error {
 	if o.Temperature != nil {
 		body["temperature"] = *o.Temperature
 	}
@@ -132,6 +136,26 @@ func applyChatOptions(body map[string]any, o gage.GenerateOptions) {
 	if o.ReasoningEffort != gage.ReasoningNone {
 		body["reasoning_effort"] = string(o.ReasoningEffort)
 	}
+	if rf := o.ResponseFormat; rf != nil {
+		switch rf.Type {
+		case "", gage.ResponseText:
+			// Default free-form output; nothing to send.
+		case gage.ResponseJSON:
+			body["response_format"] = map[string]any{"type": "json_object"}
+		case gage.ResponseJSONSchema:
+			body["response_format"] = map[string]any{
+				"type": "json_schema",
+				"json_schema": map[string]any{
+					"name":   rf.Name,
+					"schema": rawSchema(rf.Schema),
+					"strict": rf.Strict,
+				},
+			}
+		default:
+			return gage.Unsupported(provider, "response_format="+string(rf.Type))
+		}
+	}
+	return nil
 }
 
 func toChatToolChoice(tc gage.ToolChoice) any {
@@ -166,6 +190,26 @@ func rawOrEmpty(r json.RawMessage) json.RawMessage {
 type chatChunk struct {
 	Choices []chatChoice `json:"choices"`
 	Usage   *chatUsage   `json:"usage"`
+	// Error decodes in-stream {"error":{...}} payloads (OpenRouter, vLLM and
+	// other OpenAI-compatible servers report mid-stream failures this way).
+	Error *chatError `json:"error"`
+}
+
+type chatError struct {
+	Message string          `json:"message"`
+	Type    string          `json:"type"`
+	Code    json.RawMessage `json:"code"` // int or string depending on server
+}
+
+// toAPIError converts an in-stream error payload into a *gage.APIError so
+// callers can errors.Is-match ErrAuth/ErrRateLimited on numeric codes.
+func (e *chatError) toAPIError(provider string) error {
+	status := 0
+	var i int
+	if len(e.Code) > 0 && json.Unmarshal(e.Code, &i) == nil {
+		status = i
+	}
+	return &gage.APIError{Provider: provider, Status: status, Body: e.Message}
 }
 
 type chatChoice struct {

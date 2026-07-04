@@ -3,9 +3,13 @@ package tools
 import (
 	"context"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/deepteams/gage"
@@ -31,11 +35,108 @@ func TestWebFetchStripsHTML(t *testing.T) {
 }
 
 func TestWebFetchBlocksPrivateHostsByDefault(t *testing.T) {
-	tools := NewWebTools(WebConfig{})
-	fetch := toolByName(tools, "web_fetch")
-	res := run(t, fetch, `{"url":"http://localhost:1234"}`)
+	fetch := toolByName(NewWebTools(WebConfig{}), "web_fetch")
+	for _, url := range []string{
+		"http://localhost:1234",
+		"http://127.0.0.1:1234",
+		"http://10.0.0.8",
+		"http://169.254.169.254/latest/meta-data/", // cloud metadata
+		"http://100.64.0.7",                        // CGNAT
+		"http://[64:ff9b::a00:1]/",                 // NAT64-mapped 10.0.0.1
+		"http://[::1]:8080",
+	} {
+		res := run(t, fetch, `{"url":"`+url+`"}`)
+		if !res.IsError || !strings.Contains(res.Text(), "private") {
+			t.Fatalf("%s: expected private host error, got %q", url, res.Text())
+		}
+	}
+}
+
+func TestBlockedAddr(t *testing.T) {
+	blocked := []string{
+		"127.0.0.1", "10.1.2.3", "172.16.0.1", "192.168.1.1",
+		"169.254.169.254", "0.0.0.0", "224.0.0.1",
+		"100.64.0.1", "100.127.255.255", // CGNAT range
+		"::1", "fe80::1", "fd00::1",
+		"64:ff9b::808:808", // NAT64 well-known prefix
+		"::ffff:10.0.0.1",  // 4-mapped-6 private
+	}
+	for _, s := range blocked {
+		if !blockedAddr(netip.MustParseAddr(s)) {
+			t.Errorf("%s should be blocked", s)
+		}
+	}
+	allowed := []string{"8.8.8.8", "1.1.1.1", "100.63.255.255", "100.128.0.1", "2606:4700::1111"}
+	for _, s := range allowed {
+		if blockedAddr(netip.MustParseAddr(s)) {
+			t.Errorf("%s should not be blocked", s)
+		}
+	}
+}
+
+// stubResolver replaces DNS resolution for the duration of a test.
+func stubResolver(t *testing.T, fn func(ctx context.Context, host string) ([]net.IPAddr, error)) {
+	t.Helper()
+	orig := lookupIPAddr
+	lookupIPAddr = fn
+	t.Cleanup(func() { lookupIPAddr = orig })
+}
+
+// TestWebFetchBlocksDNSRebinding simulates a rebinding attack: the pre-flight
+// resolution returns a public address, then the dial-time resolution returns
+// loopback. The pinned-dial transport must catch it and never touch the server.
+func TestWebFetchBlocksDNSRebinding(t *testing.T) {
+	var hit atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hit.Store(true)
+	}))
+	t.Cleanup(srv.Close)
+	port := srv.Listener.Addr().(*net.TCPAddr).Port
+
+	var calls atomic.Int32
+	stubResolver(t, func(ctx context.Context, host string) ([]net.IPAddr, error) {
+		if calls.Add(1) == 1 {
+			return []net.IPAddr{{IP: net.ParseIP("93.184.216.34")}}, nil // public: passes pre-flight
+		}
+		return []net.IPAddr{{IP: net.ParseIP("127.0.0.1")}}, nil // rebound: must be blocked at dial
+	})
+
+	fetch := toolByName(NewWebTools(WebConfig{}), "web_fetch")
+	res := run(t, fetch, `{"url":"http://rebind.test:`+strconv.Itoa(port)+`/"}`)
 	if !res.IsError || !strings.Contains(res.Text(), "private") {
-		t.Fatalf("expected private host error, got %q", res.Text())
+		t.Fatalf("expected rebinding to be blocked, got %q", res.Text())
+	}
+	if calls.Load() < 2 {
+		t.Fatalf("expected a dial-time re-resolution, got %d lookups", calls.Load())
+	}
+	if hit.Load() {
+		t.Fatal("request reached the server despite rebinding block")
+	}
+}
+
+// TestWebFetchHostnameThroughPinnedDialer exercises the happy path through the
+// custom transport: the URL keeps the hostname (Host header) while the dial
+// goes to the vetted resolved address.
+func TestWebFetchHostnameThroughPinnedDialer(t *testing.T) {
+	var gotHost string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHost = r.Host
+		io.WriteString(w, "pinned ok")
+	}))
+	t.Cleanup(srv.Close)
+	port := srv.Listener.Addr().(*net.TCPAddr).Port
+
+	stubResolver(t, func(ctx context.Context, host string) ([]net.IPAddr, error) {
+		return []net.IPAddr{{IP: net.ParseIP("127.0.0.1")}}, nil
+	})
+
+	fetch := toolByName(NewWebTools(WebConfig{AllowPrivateHosts: true}), "web_fetch")
+	res := run(t, fetch, `{"url":"http://pinned.test:`+strconv.Itoa(port)+`/"}`)
+	if res.IsError || !strings.Contains(res.Text(), "pinned ok") {
+		t.Fatalf("pinned fetch = %q", res.Text())
+	}
+	if !strings.HasPrefix(gotHost, "pinned.test") {
+		t.Fatalf("Host header = %q, want the original hostname", gotHost)
 	}
 }
 

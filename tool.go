@@ -8,7 +8,7 @@ import (
 
 // JSONSchema is a JSON Schema document describing a tool's parameters. It is a
 // raw JSON message so callers can supply any valid schema without a struct
-// dependency; internal/jsonschema offers helpers to build common shapes.
+// dependency; the jsonschema package offers helpers to build common shapes.
 type JSONSchema = json.RawMessage
 
 // Tool is the executable port for a capability the model can invoke.
@@ -100,6 +100,9 @@ type ToolRegistry interface {
 	// Register adds a tool. It returns an error if a tool with the same name is
 	// already registered.
 	Register(t Tool) error
+	// Unregister removes the tool with the given name, reporting whether it was
+	// present. It enables dynamic tool sets (e.g. MCP tools/list_changed).
+	Unregister(name string) bool
 	// Get returns the tool with the given name.
 	Get(name string) (Tool, bool)
 	// List returns all registered tools.

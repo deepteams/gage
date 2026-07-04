@@ -18,7 +18,17 @@ var (
 	ErrMaxTurns = errors.New("gage: max turns exceeded")
 	// ErrNoProvider indicates an agent was configured without a Provider.
 	ErrNoProvider = errors.New("gage: no provider configured")
+	// ErrUnsupported indicates an explicitly requested option (e.g. a
+	// ResponseFormat or ToolChoice) that the provider cannot honor. Providers
+	// fail fast with this error instead of silently dropping the option.
+	ErrUnsupported = errors.New("gage: option not supported by this provider")
 )
+
+// Unsupported builds an ErrUnsupported-wrapping error naming the provider and
+// the offending option.
+func Unsupported(provider, option string) error {
+	return fmt.Errorf("%w: %s does not support %s", ErrUnsupported, provider, option)
+}
 
 // APIError wraps a non-2xx HTTP response from a provider or search backend.
 type APIError struct {

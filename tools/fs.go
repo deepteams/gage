@@ -11,7 +11,7 @@ import (
 	"strings"
 
 	"github.com/deepteams/gage"
-	"github.com/deepteams/gage/internal/jsonschema"
+	"github.com/deepteams/gage/jsonschema"
 )
 
 // FSConfig confines filesystem tools to a root directory. A zero Root means the
@@ -150,19 +150,35 @@ func NewFSTools(cfg FSConfig) []gage.Tool {
 
 type readFileTool struct{ cfg FSConfig }
 
-func (t *readFileTool) Name() string        { return "read_file" }
-func (t *readFileTool) Description() string { return "Read the contents of a file at the given path." }
+func (t *readFileTool) Name() string { return "read_file" }
+func (t *readFileTool) Description() string {
+	return "Read the contents of a file at the given path. Large files are returned in chunks: use offset/limit (in bytes) to page through them."
+}
 func (t *readFileTool) Schema() gage.JSONSchema {
 	return jsonschema.Object(map[string]jsonschema.Property{
-		"path": jsonschema.Str("Path to the file to read."),
+		"path":   jsonschema.Str("Path to the file to read."),
+		"offset": jsonschema.Int("Byte offset to start reading from (default 0)."),
+		"limit":  jsonschema.Int("Maximum number of bytes to return (default: the tool's read cap)."),
 	}, "path")
 }
+
+const readTruncationMarker = "\n...(truncated, use offset to read more)"
+
 func (t *readFileTool) Execute(ctx context.Context, input json.RawMessage) (gage.ToolResult, error) {
 	var args struct {
-		Path string `json:"path"`
+		Path   string `json:"path"`
+		Offset int64  `json:"offset"`
+		Limit  int64  `json:"limit"`
 	}
 	if err := json.Unmarshal(input, &args); err != nil {
 		return gage.ToolResult{}, err
+	}
+	if args.Offset < 0 {
+		return errResult(fmt.Errorf("offset must be >= 0")), nil
+	}
+	limit := t.cfg.maxRead()
+	if args.Limit > 0 && args.Limit < limit {
+		limit = args.Limit
 	}
 	p, err := t.cfg.resolveExisting(args.Path)
 	if err != nil {
@@ -173,11 +189,22 @@ func (t *readFileTool) Execute(ctx context.Context, input json.RawMessage) (gage
 		return errResult(err), nil
 	}
 	defer f.Close()
-	data, err := io.ReadAll(io.LimitReader(f, t.cfg.maxRead()))
+	if args.Offset > 0 {
+		if _, err := f.Seek(args.Offset, io.SeekStart); err != nil {
+			return errResult(err), nil
+		}
+	}
+	data, err := io.ReadAll(io.LimitReader(f, limit))
 	if err != nil {
 		return errResult(err), nil
 	}
-	return gage.TextResult("", string(data)), nil
+	text := string(data)
+	// Peek one byte past the window to report truncation explicitly.
+	var one [1]byte
+	if n, _ := f.Read(one[:]); n > 0 {
+		text += readTruncationMarker
+	}
+	return gage.TextResult("", text), nil
 }
 
 // ---- write_file ----

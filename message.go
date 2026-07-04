@@ -38,6 +38,11 @@ type ContentPart struct {
 	Image      *ImageSource `json:"image,omitempty"`       // PartImage
 	ToolCall   *ToolCall    `json:"tool_call,omitempty"`   // PartToolUse
 	ToolResult *ToolResult  `json:"tool_result,omitempty"` // PartToolResult
+	// Signature is an opaque provider token attached to a PartReasoning that
+	// must be replayed verbatim with the reasoning text for the provider to
+	// accept the block in a later turn (Anthropic thinking signatures, OpenAI
+	// Responses encrypted reasoning). Empty when the provider needs none.
+	Signature string `json:"signature,omitempty"`
 }
 
 // Message is a single turn of the conversation.
@@ -75,6 +80,12 @@ func TextPart(s string) ContentPart { return ContentPart{Kind: PartText, Text: s
 
 // ReasoningPart builds a reasoning ContentPart.
 func ReasoningPart(s string) ContentPart { return ContentPart{Kind: PartReasoning, Text: s} }
+
+// SignedReasoningPart builds a reasoning ContentPart carrying the provider's
+// replay signature.
+func SignedReasoningPart(s, signature string) ContentPart {
+	return ContentPart{Kind: PartReasoning, Text: s, Signature: signature}
+}
 
 // ToolUsePart builds a tool-use ContentPart.
 func ToolUsePart(tc ToolCall) ContentPart { return ContentPart{Kind: PartToolUse, ToolCall: &tc} }

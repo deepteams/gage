@@ -3,6 +3,7 @@ package claudecode
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -14,17 +15,8 @@ import (
 	"github.com/deepteams/gage/providers/shared/oauth"
 )
 
-func TestSystemSpoofFirstBlock(t *testing.T) {
-	blocks := systemBlocks("real system prompt")
-	if len(blocks) != 2 {
-		t.Fatalf("blocks = %v", blocks)
-	}
-	if blocks[0]["text"] != SystemSpoof {
-		t.Fatalf("first block = %v", blocks[0])
-	}
-	if blocks[1]["text"] != "real system prompt" {
-		t.Fatalf("second block = %v", blocks[1])
-	}
+func testStore() gage.TokenStore {
+	return oauth.NewMemoryStoreWith(gage.Credentials{AccessToken: "tok", ExpiresAt: time.Now().Add(time.Hour)})
 }
 
 func TestProviderStreamAndHeaders(t *testing.T) {
@@ -38,7 +30,7 @@ func TestProviderStreamAndHeaders(t *testing.T) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		fl, _ := w.(http.Flusher)
 		events := []string{
-			`event: message_start` + "\n" + `data: {"type":"message_start","message":{"usage":{"input_tokens":10,"output_tokens":0}}}`,
+			`event: message_start` + "\n" + `data: {"type":"message_start","message":{"usage":{"input_tokens":10,"output_tokens":2}}}`,
 			`event: content_block_start` + "\n" + `data: {"type":"content_block_start","index":0,"content_block":{"type":"text"}}`,
 			`event: content_block_delta` + "\n" + `data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hi"}}`,
 			`event: content_block_stop` + "\n" + `data: {"type":"content_block_stop","index":0}`,
@@ -54,8 +46,7 @@ func TestProviderStreamAndHeaders(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	store := oauth.NewMemoryStoreWith(gage.Credentials{AccessToken: "tok", ExpiresAt: time.Now().Add(time.Hour)})
-	p := New(store, false, WithMessagesURL(srv.URL))
+	p := New(testStore(), false, WithMessagesURL(srv.URL))
 	ch, err := p.Stream(context.Background(), gage.Request{
 		System:   "sys",
 		Messages: []gage.Message{gage.UserText("hi")},
@@ -66,7 +57,7 @@ func TestProviderStreamAndHeaders(t *testing.T) {
 
 	var text strings.Builder
 	var usage *gage.Usage
-	var stop string
+	var stop gage.StopReason
 	for e := range ch {
 		switch e.Type {
 		case gage.EventTextDelta:
@@ -80,22 +71,24 @@ func TestProviderStreamAndHeaders(t *testing.T) {
 	if text.String() != "Hi" {
 		t.Fatalf("text = %q", text.String())
 	}
+	// message_delta usage is cumulative: output_tokens 5 replaces the
+	// message_start figure (2), it is not added to it.
 	if usage == nil || usage.InputTokens != 10 || usage.OutputTokens != 5 {
 		t.Fatalf("usage = %+v", usage)
 	}
-	if stop != "end_turn" {
+	if stop != gage.StopEndTurn {
 		t.Fatalf("stop = %q", stop)
 	}
 	if gotAuth != "Bearer tok" || !strings.Contains(gotBeta, "oauth-2025-04-20") || gotVersion != AnthropicVersion {
 		t.Fatalf("headers auth=%q beta=%q version=%q", gotAuth, gotBeta, gotVersion)
 	}
 
-	// Verify the spoof block was sent first.
+	// Verify the spoof block was sent first, followed by the caller's system.
 	var body map[string]any
 	json.Unmarshal(reqBody, &body)
 	sys := body["system"].([]any)
-	if sys[0].(map[string]any)["text"] != SystemSpoof {
-		t.Fatalf("system spoof missing: %v", sys)
+	if len(sys) != 2 || sys[0].(map[string]any)["text"] != SystemSpoof || sys[1].(map[string]any)["text"] != "sys" {
+		t.Fatalf("system blocks = %v", sys)
 	}
 }
 
@@ -115,14 +108,13 @@ func TestProviderToolCall(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	store := oauth.NewMemoryStoreWith(gage.Credentials{AccessToken: "tok", ExpiresAt: time.Now().Add(time.Hour)})
-	p := New(store, false, WithMessagesURL(srv.URL))
+	p := New(testStore(), false, WithMessagesURL(srv.URL))
 	ch, err := p.Stream(context.Background(), gage.Request{Messages: []gage.Message{gage.UserText("run ls")}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	var done *gage.ToolCall
-	var stop string
+	var stop gage.StopReason
 	for e := range ch {
 		switch e.Type {
 		case gage.EventToolCallDone:
@@ -134,7 +126,25 @@ func TestProviderToolCall(t *testing.T) {
 	if done == nil || done.Name != "bash" || string(done.Input) != `{"cmd":"ls"}` {
 		t.Fatalf("done = %+v", done)
 	}
-	if stop != "tool_use" {
+	if stop != gage.StopToolUse {
 		t.Fatalf("stop = %q", stop)
+	}
+}
+
+func TestProviderResponseFormatUnsupported(t *testing.T) {
+	// The spoofed backend must not be poked with structured-output betas:
+	// Stream fails fast, before dialing.
+	p := New(testStore(), false, WithMessagesURL("http://127.0.0.1:0"))
+	_, err := p.Stream(context.Background(), gage.Request{
+		Messages: []gage.Message{gage.UserText("hi")},
+		Options: gage.GenerateOptions{
+			ResponseFormat: &gage.ResponseFormat{Type: gage.ResponseJSONSchema, Name: "out"},
+		},
+	})
+	if !errors.Is(err, gage.ErrUnsupported) {
+		t.Fatalf("err = %v, want ErrUnsupported", err)
+	}
+	if err == nil || !strings.Contains(err.Error(), "claudecode") {
+		t.Fatalf("err should name the provider: %v", err)
 	}
 }

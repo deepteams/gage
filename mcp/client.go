@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"os/exec"
+	"sync"
 
 	"github.com/deepteams/gage"
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
@@ -18,6 +19,40 @@ var implementation = &mcpsdk.Implementation{Name: "gage", Version: "0.1.0"}
 type Client struct {
 	session *mcpsdk.ClientSession
 	name    string
+
+	// syncMu serializes tool-list reconciliations (see WithToolSync).
+	syncMu  sync.Mutex
+	syncReg gage.ToolRegistry
+}
+
+// Option configures a Client at connect time.
+type Option func(*clientOptions)
+
+type clientOptions struct {
+	syncReg  gage.ToolRegistry
+	sampling gage.Provider
+}
+
+// WithToolSync keeps reg in sync with the server's tool list: when the server
+// sends a tools/list_changed notification, the client re-lists the tools and
+// reconciles the registry — new tools are registered, vanished tools are
+// unregistered, and changed tools are replaced. Only tools carrying this
+// client's "<server>__" prefix are touched. Reconciliation is serialized, so
+// concurrent notifications cannot interleave.
+//
+// The option only reacts to change notifications; call Register (or SyncTools)
+// once after connecting to perform the initial registration.
+func WithToolSync(reg gage.ToolRegistry) Option {
+	return func(o *clientOptions) { o.syncReg = reg }
+}
+
+// WithSamplingProvider declares the MCP sampling capability and serves the
+// server's sampling/createMessage requests with p: the request's messages,
+// system prompt and generation parameters are mapped onto a gage.Request,
+// p.Stream is run to completion, and the accumulated text is returned as the
+// assistant message. Requests carrying non-text content are rejected.
+func WithSamplingProvider(p gage.Provider) Option {
+	return func(o *clientOptions) { o.sampling = p }
 }
 
 // StdioConfig connects to an MCP server launched as a subprocess over stdio.
@@ -35,7 +70,7 @@ type StdioConfig struct {
 }
 
 // ConnectStdio launches the command and connects over stdin/stdout.
-func ConnectStdio(ctx context.Context, cfg StdioConfig) (*Client, error) {
+func ConnectStdio(ctx context.Context, cfg StdioConfig, opts ...Option) (*Client, error) {
 	if cfg.Command == "" {
 		return nil, fmt.Errorf("mcp: stdio command is required")
 	}
@@ -45,7 +80,7 @@ func ConnectStdio(ctx context.Context, cfg StdioConfig) (*Client, error) {
 		cmd.Env = append(cmd.Environ(), cfg.Env...)
 	}
 	transport := &mcpsdk.CommandTransport{Command: cmd}
-	return connect(ctx, cfg.Name, transport)
+	return connect(ctx, cfg.Name, transport, opts...)
 }
 
 // HTTPConfig connects to an MCP server over streamable HTTP.
@@ -61,7 +96,7 @@ type HTTPConfig struct {
 }
 
 // ConnectHTTP connects to a streamable HTTP MCP server.
-func ConnectHTTP(ctx context.Context, cfg HTTPConfig) (*Client, error) {
+func ConnectHTTP(ctx context.Context, cfg HTTPConfig, opts ...Option) (*Client, error) {
 	if cfg.Endpoint == "" {
 		return nil, fmt.Errorf("mcp: http endpoint is required")
 	}
@@ -69,19 +104,46 @@ func ConnectHTTP(ctx context.Context, cfg HTTPConfig) (*Client, error) {
 		Endpoint:   cfg.Endpoint,
 		HTTPClient: httpClientWithHeaders(cfg.HTTPClient, cfg.Headers),
 	}
-	return connect(ctx, cfg.Name, transport)
+	return connect(ctx, cfg.Name, transport, opts...)
 }
 
-func connect(ctx context.Context, name string, transport mcpsdk.Transport) (*Client, error) {
+func connect(ctx context.Context, name string, transport mcpsdk.Transport, opts ...Option) (*Client, error) {
 	if name == "" {
 		return nil, fmt.Errorf("mcp: server name is required")
 	}
-	client := mcpsdk.NewClient(implementation, nil)
+	var o clientOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
+	c := &Client{name: name, syncReg: o.syncReg}
+
+	// Notification handlers and the sampling capability must be wired before
+	// the session exists, so the closures reach the session through the request
+	// (or through c after connect returns).
+	var sdkOpts *mcpsdk.ClientOptions
+	if o.syncReg != nil || o.sampling != nil {
+		sdkOpts = &mcpsdk.ClientOptions{}
+		if o.syncReg != nil {
+			sdkOpts.ToolListChangedHandler = func(ctx context.Context, req *mcpsdk.ToolListChangedRequest) {
+				// Notification handlers cannot return errors; a failed refresh
+				// leaves the registry as-is until the next notification.
+				_ = c.syncTools(ctx, req.Session)
+			}
+		}
+		if o.sampling != nil {
+			sdkOpts.CreateMessageHandler = func(ctx context.Context, req *mcpsdk.CreateMessageRequest) (*mcpsdk.CreateMessageResult, error) {
+				return createMessage(ctx, o.sampling, req.Params)
+			}
+		}
+	}
+
+	client := mcpsdk.NewClient(implementation, sdkOpts)
 	session, err := client.Connect(ctx, transport, nil)
 	if err != nil {
 		return nil, fmt.Errorf("mcp: connect %s: %w", name, err)
 	}
-	return &Client{session: session, name: name}, nil
+	c.session = session
+	return c, nil
 }
 
 // Close terminates the session (and, for stdio, the subprocess).
@@ -99,15 +161,19 @@ func (c *Client) Name() string { return c.name }
 // are prefixed with the server name ("<server>__<tool>") to avoid collisions in
 // a shared registry. Pagination is followed to completion.
 func (c *Client) Tools(ctx context.Context) ([]gage.Tool, error) {
+	return listTools(ctx, c.session, c.name)
+}
+
+func listTools(ctx context.Context, session *mcpsdk.ClientSession, server string) ([]gage.Tool, error) {
 	var out []gage.Tool
 	var cursor string
 	for {
-		res, err := c.session.ListTools(ctx, &mcpsdk.ListToolsParams{Cursor: cursor})
+		res, err := session.ListTools(ctx, &mcpsdk.ListToolsParams{Cursor: cursor})
 		if err != nil {
-			return nil, fmt.Errorf("mcp: list tools %s: %w", c.name, err)
+			return nil, fmt.Errorf("mcp: list tools %s: %w", server, err)
 		}
 		for _, t := range res.Tools {
-			out = append(out, c.adapt(t))
+			out = append(out, adaptTool(session, server, t))
 		}
 		if res.NextCursor == "" {
 			break

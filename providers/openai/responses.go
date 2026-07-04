@@ -101,8 +101,39 @@ func (c *ResponsesClient) buildBody(req gage.Request) ([]byte, error) {
 	if len(req.Tools) > 0 {
 		body["tools"] = toResponsesTools(req.Tools)
 	}
+	if len(req.Options.StopSequences) > 0 {
+		// The Responses API has no stop-sequence parameter (unlike Chat
+		// Completions' "stop"); fail fast rather than silently dropping it.
+		return nil, gage.Unsupported(c.ProviderName, "stop_sequences")
+	}
+	if req.Options.ToolChoice != nil {
+		body["tool_choice"] = toResponsesToolChoice(*req.Options.ToolChoice)
+	}
 	if req.Options.ReasoningEffort != gage.ReasoningNone {
 		body["reasoning"] = map[string]any{"effort": string(req.Options.ReasoningEffort)}
+		if !c.Store {
+			// With store=false the server keeps no state, so replayable
+			// reasoning must round-trip through the conversation history as
+			// encrypted_content.
+			body["include"] = []string{"reasoning.encrypted_content"}
+		}
+	}
+	if rf := req.Options.ResponseFormat; rf != nil {
+		switch rf.Type {
+		case "", gage.ResponseText:
+			// Default free-form output; nothing to send.
+		case gage.ResponseJSON:
+			body["text"] = map[string]any{"format": map[string]any{"type": "json_object"}}
+		case gage.ResponseJSONSchema:
+			body["text"] = map[string]any{"format": map[string]any{
+				"type":   "json_schema",
+				"name":   rf.Name,
+				"schema": rawSchema(rf.Schema),
+				"strict": rf.Strict,
+			}}
+		default:
+			return nil, gage.Unsupported(c.ProviderName, "response_format="+string(rf.Type))
+		}
 	}
 	if req.Options.MaxTokens > 0 {
 		body["max_output_tokens"] = req.Options.MaxTokens
@@ -121,21 +152,14 @@ func (c *ResponsesClient) pump(ctx context.Context, resp *http.Response, out cha
 	defer close(out)
 	defer resp.Body.Close()
 
-	send := func(e gage.Event) bool {
-		select {
-		case out <- e:
-			return true
-		case <-ctx.Done():
-			return false
-		}
-	}
+	send := func(e gage.Event) bool { return shared.Send(ctx, out, e) }
 	if !send(gage.MessageStart()) {
 		return
 	}
 
 	// Track streamed function calls by their output item id.
 	calls := map[string]*gage.ToolCall{}
-	stopReason := "end_turn"
+	stopReason := gage.StopEndTurn
 
 	err := shared.ScanSSE(resp.Body, func(ev shared.SSEEvent) error {
 		var re responsesEvent
@@ -160,8 +184,17 @@ func (c *ResponsesClient) pump(ctx context.Context, resp *http.Response, out cha
 			if re.Item != nil && re.Item.Type == "function_call" {
 				tc := &gage.ToolCall{ID: itemCallID(re.Item), Name: re.Item.Name}
 				calls[re.Item.ID] = tc
-				stopReason = "tool_use"
+				stopReason = gage.StopToolUse
 				if !send(gage.ToolCallStart(*tc)) {
+					return ctx.Err()
+				}
+			}
+		case "response.output_item.done":
+			// A completed reasoning item carries the encrypted replay token
+			// when "reasoning.encrypted_content" was requested; surface it so
+			// the caller can replay the block on the next turn.
+			if re.Item != nil && re.Item.Type == "reasoning" && re.Item.EncryptedContent != "" {
+				if !send(gage.ReasoningDone(re.Item.EncryptedContent)) {
 					return ctx.Err()
 				}
 			}

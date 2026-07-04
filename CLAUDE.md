@@ -21,24 +21,27 @@ Everything streams end to end via `<-chan gage.Event`.
 - **Core** (root package `gage`): domain types + ports. Depends on nothing
   outside the stdlib.
   - Domain: `message.go`, `tool_call.go`, `event.go`, `usage.go`, `options.go`,
-    `model.go`, `errors.go`.
+    `result.go`, `model.go`, `errors.go`.
   - Ports (interfaces): `provider.go` (`Provider`), `tool.go` (`Tool`,
     `ToolRegistry`), `search.go` (`SearchProvider`), `permission.go`
-    (`Approver`), `auth.go` (`TokenStore`).
+    (`Approver`), `compact.go` (`Compactor`), `auth.go` (`TokenStore`).
 - **Adapters** (sub-packages): depend on the core, never the reverse.
   - `providers/` — `Provider` implementations. `providers/shared` has the HTTP
-    client (retry), SSE parser, and OAuth (PKCE, `TokenSource`, stores).
-    `providers/openai` holds the reusable Chat Completions (`chat.go`) and
-    Responses (`responses.go`) wire formats; openrouter/vllm/ollama and codex
-    build on them.
-  - `tools/` — built-in tools, `MapRegistry`, and the permission `Guard`.
+    client (retry), SSE parser, `Send` helper, and OAuth (PKCE, `TokenSource`,
+    stores). `providers/openai` holds the reusable Chat Completions (`chat.go`)
+    and Responses (`responses.go`) wire formats; openrouter/vllm/ollama and
+    codex build on them. `providers/anthropic` holds the reusable Messages wire
+    format and the API-key provider; claudecode builds on it.
+  - `tools/` — built-in tools, `Typed[T]` reflected tools, `MapRegistry`, the
+    permission `Guard`, and the `LimitConcurrency`/`LimitResultSize` wrappers.
   - `search/` — `SearchProvider` impls (duckduckgo has no key).
   - `mcp/` — wraps `github.com/modelcontextprotocol/go-sdk`; adapts MCP tools to
-    `gage.Tool`.
+    `gage.Tool`, plus resources, prompts, `tools/list_changed` sync, and
+    sampling backed by a `gage.Provider`.
   - `skills/` — `SKILL.md` loader + the `skill` tool.
-  - `agent/` — the loop (`loop.go`), config, sub-agents.
+  - `agent/` — the loop (`loop.go`), config, hooks, compactors, sub-agents.
   - `httpx/` — SSE handler.
-  - `internal/jsonschema` — tiny JSON Schema builder for tool params.
+  - `jsonschema/` — JSON Schema builder for tool params (public).
 
 **Rule:** never import an adapter package from the core. If the core needs a
 capability, express it as a port (interface) and let an adapter implement it.
@@ -49,12 +52,16 @@ capability, express it as a port (interface) and let an adapter implement it.
 SSE/JSON and routes in a `select`. A provider emits:
 
 ```
-message_start → (text_delta | reasoning_delta | tool_call_start/delta/end)* → usage → message_done
+message_start → (text_delta | reasoning_delta | reasoning_done | tool_call_start/delta/end)* → usage → message_done
 ```
 
-and closes its channel (or emits `error` then closes). The agent relays these
-(tagging `Turn`), inserts `tool_result` after executing tools, and ends with
-`done`.
+and closes its channel (or emits `error` then closes). `reasoning_done` closes
+a reasoning block and carries the provider's opaque replay signature; the agent
+preserves signed reasoning parts in history and encoders replay them (Anthropic
+extended thinking requires this). The agent relays all events (tagging `Turn`),
+inserts `tool_result` after executing tools, and ends with `done` carrying a
+`gage.Result` (full conversation, final text, stop reason, aggregated usage,
+turn count).
 
 ## Conventions
 
@@ -63,6 +70,13 @@ and closes its channel (or emits `error` then closes). The agent relays these
 - Wrap errors with `%w`; use the sentinels in `errors.go` (`ErrAuth`,
   `ErrRateLimited`, ...). Provider HTTP failures become `*gage.APIError`, which
   `errors.Is`-matches `ErrAuth`/`ErrRateLimited` by status.
+- Providers never silently drop an explicitly requested option: if a provider
+  cannot honor `ResponseFormat`, `ToolChoice`, `StopSequences`, or
+  `ReasoningEffort`, `Stream` fails fast with `gage.Unsupported(provider,
+  option)` (matching `ErrUnsupported`). `PromptCache` is the exception — it is
+  a hint, ignored where the provider has no explicit cache control.
+- Stop reasons are typed (`gage.StopReason`); providers normalize their wire
+  values onto the `Stop*` constants and pass unknown values through verbatim.
 - Tool-level failures are returned as a `ToolResult` with `IsError: true` (so
   the model sees them), **not** as a Go `error`. Reserve the `error` return for
   infrastructure failures.
@@ -84,12 +98,14 @@ and closes its channel (or emits `error` then closes). The agent relays these
 
 - **A new provider:** implement `gage.Provider` in `providers/<name>`. If it
   speaks OpenAI Chat Completions, embed `openai.ChatClient`; if Responses, embed
-  `openai.ResponsesClient`; otherwise write a `pump` goroutine that parses the
-  stream into `gage.Event`s (see `providers/ollama/native.go` for a non-SSE
+  `openai.ResponsesClient`; if Anthropic Messages, build on
+  `providers/anthropic.Client`; otherwise write a `pump` goroutine that parses
+  the stream into `gage.Event`s (see `providers/ollama/native.go` for a non-SSE
   example). Test with an `httptest` server returning a recorded stream and
   assert both the request body mapping and the event sequence.
-- **A new tool:** implement `gage.Tool` (or use `tools.Func`). Give it a JSON
-  Schema via `internal/jsonschema`. Test on `t.TempDir()`.
+- **A new tool:** prefer `tools.Typed[T]` (schema reflected from a struct);
+  otherwise implement `gage.Tool` (or use `tools.Func`) with a schema from the
+  `jsonschema` package. Test on `t.TempDir()`.
 - **A new search backend:** implement `gage.SearchProvider` in `search/<name>`.
 
 ## Commands

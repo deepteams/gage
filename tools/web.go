@@ -14,7 +14,7 @@ import (
 	"time"
 
 	"github.com/deepteams/gage"
-	"github.com/deepteams/gage/internal/jsonschema"
+	"github.com/deepteams/gage/jsonschema"
 )
 
 // WebConfig configures the web tools.
@@ -104,10 +104,18 @@ func (t *webFetchTool) Execute(ctx context.Context, input json.RawMessage) (gage
 	return gage.TextResult("", string(text)), nil
 }
 
+// httpClient derives the client used by web_fetch from the configured base
+// client. It installs a redirect validator (every hop must pass
+// validateFetchURL) and, to defeat DNS rebinding (TOCTOU between the
+// pre-flight check and the connection), a dialer that resolves the hostname
+// once, validates every returned address, and dials one of those exact
+// addresses. The URL keeps the original hostname, so the Host header and TLS
+// ServerName/SNI are unchanged.
 func (c WebConfig) httpClient() *http.Client {
 	base := c.http()
 	client := *base
-	originalRedirect := client.CheckRedirect
+	client.Transport = c.pinnedTransport(base.Transport)
+	originalRedirect := base.CheckRedirect
 	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 		if _, err := validateFetchURL(req.Context(), req.URL.String(), c.AllowPrivateHosts); err != nil {
 			return err
@@ -123,6 +131,88 @@ func (c WebConfig) httpClient() *http.Client {
 	return &client
 }
 
+// pinnedTransport clones the base transport and overrides DialContext so name
+// resolution and address validation happen atomically with dialing. When the
+// base RoundTripper is not an *http.Transport it cannot be re-dialed safely
+// and is returned unchanged; the pre-flight and per-redirect URL validation
+// still apply.
+func (c WebConfig) pinnedTransport(rt http.RoundTripper) http.RoundTripper {
+	var t *http.Transport
+	switch base := rt.(type) {
+	case nil:
+		t = http.DefaultTransport.(*http.Transport).Clone()
+	case *http.Transport:
+		t = base.Clone()
+	default:
+		return rt
+	}
+	dialer := &net.Dialer{Timeout: 15 * time.Second}
+	t.DialContext = func(ctx context.Context, network, hostport string) (net.Conn, error) {
+		host, port, err := net.SplitHostPort(hostport)
+		if err != nil {
+			return nil, err
+		}
+		addrs, err := resolveVetted(ctx, host, c.AllowPrivateHosts)
+		if err != nil {
+			return nil, err
+		}
+		var firstErr error
+		for _, addr := range addrs {
+			conn, err := dialer.DialContext(ctx, network, net.JoinHostPort(addr.String(), port))
+			if err == nil {
+				return conn, nil
+			}
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
+		return nil, firstErr
+	}
+	return t
+}
+
+// lookupIPAddr resolves a hostname. It is a variable so tests can simulate
+// DNS rebinding without the network.
+var lookupIPAddr = func(ctx context.Context, host string) ([]net.IPAddr, error) {
+	return net.DefaultResolver.LookupIPAddr(ctx, host)
+}
+
+// resolveVetted resolves host and, unless allowPrivate, rejects the whole
+// lookup if any returned address is private/blocked. The returned addresses
+// are the ones that must be dialed: dialing anything else would allow the DNS
+// answer to change between validation and connection.
+func resolveVetted(ctx context.Context, host string, allowPrivate bool) ([]netip.Addr, error) {
+	host = strings.TrimSuffix(strings.ToLower(host), ".")
+	if addr, err := netip.ParseAddr(host); err == nil {
+		if !allowPrivate && blockedAddr(addr) {
+			return nil, fmt.Errorf("url host %q is private", host)
+		}
+		return []netip.Addr{addr}, nil
+	}
+	if !allowPrivate && (host == "localhost" || strings.HasSuffix(host, ".localhost")) {
+		return nil, fmt.Errorf("url host %q is private", host)
+	}
+	ipAddrs, err := lookupIPAddr(ctx, host)
+	if err != nil {
+		return nil, fmt.Errorf("resolve %q: %w", host, err)
+	}
+	addrs := make([]netip.Addr, 0, len(ipAddrs))
+	for _, ip := range ipAddrs {
+		addr, ok := netip.AddrFromSlice(ip.IP)
+		if !ok {
+			continue
+		}
+		if !allowPrivate && blockedAddr(addr) {
+			return nil, fmt.Errorf("url host %q resolves to private address", host)
+		}
+		addrs = append(addrs, addr)
+	}
+	if len(addrs) == 0 {
+		return nil, fmt.Errorf("resolve %q: no addresses", host)
+	}
+	return addrs, nil
+}
+
 func validateFetchURL(ctx context.Context, raw string, allowPrivate bool) (*url.URL, error) {
 	u, err := url.Parse(raw)
 	if err != nil {
@@ -134,37 +224,16 @@ func validateFetchURL(ctx context.Context, raw string, allowPrivate bool) (*url.
 	if u.Hostname() == "" {
 		return nil, fmt.Errorf("url host is required")
 	}
-	if !allowPrivate {
-		if err := rejectPrivateHost(ctx, u.Hostname()); err != nil {
-			return nil, err
-		}
+	if _, err := resolveVetted(ctx, u.Hostname(), allowPrivate); err != nil {
+		return nil, err
 	}
 	return u, nil
 }
 
-func rejectPrivateHost(ctx context.Context, host string) error {
-	host = strings.TrimSuffix(strings.ToLower(host), ".")
-	if host == "localhost" || strings.HasSuffix(host, ".localhost") {
-		return fmt.Errorf("url host %q is private", host)
-	}
-	if addr, err := netip.ParseAddr(host); err == nil {
-		if blockedAddr(addr) {
-			return fmt.Errorf("url host %q is private", host)
-		}
-		return nil
-	}
-	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
-	if err != nil {
-		return fmt.Errorf("resolve %q: %w", host, err)
-	}
-	for _, ip := range addrs {
-		addr, ok := netip.AddrFromSlice(ip.IP)
-		if ok && blockedAddr(addr) {
-			return fmt.Errorf("url host %q resolves to private address", host)
-		}
-	}
-	return nil
-}
+var (
+	cgnatPrefix = netip.MustParsePrefix("100.64.0.0/10") // RFC 6598 carrier-grade NAT
+	nat64Prefix = netip.MustParsePrefix("64:ff9b::/96")  // RFC 6052 NAT64 well-known prefix
+)
 
 func blockedAddr(addr netip.Addr) bool {
 	addr = addr.Unmap()
@@ -173,7 +242,11 @@ func blockedAddr(addr netip.Addr) bool {
 		addr.IsLinkLocalUnicast() ||
 		addr.IsLinkLocalMulticast() ||
 		addr.IsMulticast() ||
-		addr.IsUnspecified()
+		addr.IsUnspecified() ||
+		cgnatPrefix.Contains(addr) ||
+		// A NAT64 gateway would translate these to the embedded IPv4 address,
+		// bypassing the IPv4 checks; block the whole well-known prefix.
+		nat64Prefix.Contains(addr)
 }
 
 var (

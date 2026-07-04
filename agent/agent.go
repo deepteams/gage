@@ -53,3 +53,42 @@ func (a *Agent) start(ctx context.Context, input []gage.Message, cancel context.
 func nextRunID() string {
 	return fmt.Sprintf("%d-%d", time.Now().UnixNano(), runSeq.Add(1))
 }
+
+// RunSync executes the loop and blocks until it completes, returning the run
+// summary. Streaming consumers should use Run; RunSync is the convenience for
+// callers that only want the outcome.
+func (a *Agent) RunSync(ctx context.Context, input []gage.Message) (*gage.Result, error) {
+	stream, err := a.Run(ctx, input)
+	if err != nil {
+		return nil, err
+	}
+	return Collect(ctx, stream)
+}
+
+// Collect drains an agent event stream and returns its terminal Result. It
+// returns the stream's error event as a Go error, and ctx.Err() when the
+// stream closed because the run was cancelled or timed out before finishing.
+func Collect(ctx context.Context, stream <-chan gage.Event) (*gage.Result, error) {
+	var lastErr error
+	for ev := range stream {
+		switch ev.Type {
+		case gage.EventDone:
+			if ev.Result != nil {
+				return ev.Result, nil
+			}
+		case gage.EventError:
+			if ev.Err != nil {
+				lastErr = ev.Err
+			} else {
+				lastErr = &loopError{ev.ErrorString}
+			}
+		}
+	}
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	return nil, &loopError{"run ended without a result"}
+}

@@ -27,7 +27,7 @@ func TestStreamHandlerFraming(t *testing.T) {
 		gage.MessageStart(),
 		gage.TextDelta("hi"),
 		gage.MessageDone("end_turn"),
-		gage.DoneEvent(),
+		gage.DoneEvent(nil),
 	}}
 	h := StreamHandler(runner, func(r *http.Request) ([]gage.Message, error) {
 		return []gage.Message{gage.UserText("x")}, nil

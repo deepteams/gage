@@ -27,14 +27,27 @@ type Config struct {
 	Skills *skills.Set
 	// Approver, if set, gates every tool execution.
 	Approver gage.Approver
+	// Hooks intercept and may alter the run (requests, tool inputs, results).
+	Hooks Hooks
 	// Observer, if set, receives structured lifecycle observations for audit,
 	// metrics, and tracing. Observer panics are recovered and ignored.
 	Observer Observer
+	// Compactor, if set together with CompactAfter, shrinks the conversation
+	// between turns once the provider-reported input tokens reach the
+	// threshold.
+	Compactor gage.Compactor
+	// CompactAfter is the input-token threshold that triggers Compactor.
+	CompactAfter int
 	// Options are the default generation options per turn.
 	Options gage.GenerateOptions
 	// MaxTurns caps loop iterations (default 16). A turn is one provider call
 	// plus any tool executions it triggers.
 	MaxTurns int
+	// MaxParallelTools bounds how many of a turn's tool calls run
+	// concurrently. 0 or 1 means sequential execution. Tool-result events are
+	// emitted as executions finish, but results are fed back to the model in
+	// the order the calls were made.
+	MaxParallelTools int
 	// Timeout bounds a single Run (default: no timeout). Uses context.WithTimeout.
 	Timeout time.Duration
 	// ToolTimeout bounds each individual tool execution (default: no per-tool

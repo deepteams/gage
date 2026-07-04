@@ -11,6 +11,31 @@ const (
 	ReasoningHigh   ReasoningEffort = "high"
 )
 
+// ResponseFormatType selects how the model's final answer is constrained.
+type ResponseFormatType string
+
+const (
+	// ResponseText is the default free-form output.
+	ResponseText ResponseFormatType = "text"
+	// ResponseJSON asks for syntactically valid JSON without a schema.
+	ResponseJSON ResponseFormatType = "json"
+	// ResponseJSONSchema constrains the output to Schema.
+	ResponseJSONSchema ResponseFormatType = "json_schema"
+)
+
+// ResponseFormat constrains the shape of the model's final answer (structured
+// output). Providers that cannot honor an explicitly requested format must
+// fail the request with ErrUnsupported rather than silently ignore it.
+type ResponseFormat struct {
+	Type ResponseFormatType `json:"type"`
+	// Name labels the schema (required by some providers for json_schema).
+	Name string `json:"name,omitempty"`
+	// Schema is the JSON Schema of the expected output (json_schema only).
+	Schema JSONSchema `json:"schema,omitempty"`
+	// Strict requests exact schema adherence where the provider supports it.
+	Strict bool `json:"strict,omitempty"`
+}
+
 // GenerateOptions carries per-request generation parameters. All fields are
 // optional; providers apply their own defaults for zero values. Pointer fields
 // distinguish "unset" from a meaningful zero (e.g. Temperature 0).
@@ -21,6 +46,13 @@ type GenerateOptions struct {
 	StopSequences   []string
 	ToolChoice      *ToolChoice
 	ReasoningEffort ReasoningEffort
+	// ResponseFormat constrains the model output (JSON mode / JSON Schema).
+	ResponseFormat *ResponseFormat
+	// PromptCache asks the provider to mark stable prefixes (system prompt,
+	// tool schemas, conversation head) as cacheable. It is a hint: providers
+	// with implicit caching (OpenAI) ignore it, providers with explicit
+	// breakpoints (Anthropic cache_control) act on it. It never fails.
+	PromptCache bool
 	// Extra passes provider-specific fields verbatim into the request body.
 	// Keys are merged at the top level; use with care.
 	Extra map[string]any
@@ -58,6 +90,24 @@ func WithToolChoice(tc ToolChoice) Option {
 // WithReasoningEffort sets the reasoning effort hint.
 func WithReasoningEffort(e ReasoningEffort) Option {
 	return func(o *GenerateOptions) { o.ReasoningEffort = e }
+}
+
+// WithResponseFormat constrains the model output.
+func WithResponseFormat(rf ResponseFormat) Option {
+	return func(o *GenerateOptions) { o.ResponseFormat = &rf }
+}
+
+// WithJSONSchema constrains the output to a named JSON Schema (strict).
+func WithJSONSchema(name string, schema JSONSchema) Option {
+	return func(o *GenerateOptions) {
+		o.ResponseFormat = &ResponseFormat{Type: ResponseJSONSchema, Name: name, Schema: schema, Strict: true}
+	}
+}
+
+// WithPromptCache enables prompt-cache breakpoints on providers that support
+// explicit caching.
+func WithPromptCache() Option {
+	return func(o *GenerateOptions) { o.PromptCache = true }
 }
 
 // WithExtra sets a provider-specific field.

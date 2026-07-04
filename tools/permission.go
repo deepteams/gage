@@ -14,7 +14,7 @@ func Guard(t gage.Tool, approver gage.Approver, agentName string) gage.Tool {
 	if approver == nil {
 		return t
 	}
-	return &guarded{Tool: t, approver: approver, agent: agentName}
+	return &guarded{forwarding: forwarding{t}, approver: approver, agent: agentName}
 }
 
 // GuardAll wraps each tool with Guard.
@@ -30,13 +30,13 @@ func GuardAll(tools []gage.Tool, approver gage.Approver, agentName string) []gag
 }
 
 type guarded struct {
-	gage.Tool
+	forwarding
 	approver gage.Approver
 	agent    string
 }
 
 func (g *guarded) Execute(ctx context.Context, input json.RawMessage) (gage.ToolResult, error) {
-	decision, err := g.approver.Approve(ctx, gage.PermissionRequest{
+	approval, err := g.approver.Approve(ctx, gage.PermissionRequest{
 		Tool:     g.Tool.Name(),
 		Input:    input,
 		Agent:    g.agent,
@@ -46,16 +46,15 @@ func (g *guarded) Execute(ctx context.Context, input json.RawMessage) (gage.Tool
 	if err != nil {
 		return gage.ToolResult{}, err
 	}
-	if decision == gage.Deny {
-		return gage.ErrorResult("", "permission denied for tool "+g.Tool.Name()), nil
+	if !approval.Allow {
+		msg := "permission denied for tool " + g.Tool.Name()
+		if approval.Reason != "" {
+			msg += ": " + approval.Reason
+		}
+		return gage.ErrorResult("", msg), nil
+	}
+	if approval.UpdatedInput != nil {
+		input = approval.UpdatedInput
 	}
 	return g.Tool.Execute(ctx, input)
-}
-
-func (g *guarded) Metadata() gage.ToolMetadata {
-	return gage.MetadataOf(g.Tool)
-}
-
-func (g *guarded) DescribeCall(input json.RawMessage) string {
-	return gage.CallSummaryOf(g.Tool, input)
 }

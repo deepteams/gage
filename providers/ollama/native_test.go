@@ -3,6 +3,7 @@ package ollama
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -51,7 +52,7 @@ func TestNativeStreamText(t *testing.T) {
 	}
 	var text strings.Builder
 	var usage *gage.Usage
-	var stop string
+	var stop gage.StopReason
 	for e := range ch {
 		switch e.Type {
 		case gage.EventTextDelta:
@@ -68,7 +69,7 @@ func TestNativeStreamText(t *testing.T) {
 	if usage == nil || usage.InputTokens != 7 || usage.OutputTokens != 3 {
 		t.Fatalf("usage = %+v", usage)
 	}
-	if stop != "end_turn" {
+	if stop != gage.StopEndTurn {
 		t.Fatalf("stop = %q", stop)
 	}
 
@@ -93,7 +94,7 @@ func TestNativeStreamToolCall(t *testing.T) {
 		t.Fatal(err)
 	}
 	var done *gage.ToolCall
-	var stop string
+	var stop gage.StopReason
 	for e := range ch {
 		switch e.Type {
 		case gage.EventToolCallDone:
@@ -105,7 +106,7 @@ func TestNativeStreamToolCall(t *testing.T) {
 	if done == nil || done.Name != "list_dir" || string(done.Input) != `{"path":"."}` {
 		t.Fatalf("done = %+v", done)
 	}
-	if stop != "tool_use" {
+	if stop != gage.StopToolUse {
 		t.Fatalf("stop = %q", stop)
 	}
 }
@@ -114,5 +115,93 @@ func TestOpenAICompatMode(t *testing.T) {
 	p := New("http://x:11434", WithOpenAICompat())
 	if p.Name() != "ollama" {
 		t.Fatalf("name = %q", p.Name())
+	}
+}
+
+func TestNativeRequestOptionsMapping(t *testing.T) {
+	lines := []string{`{"message":{"content":"{}"},"done":true,"done_reason":"stop"}`}
+	var reqBody []byte
+	srv := ndjsonServer(t, lines, &reqBody)
+	p := New(srv.URL, WithDefaultModel("llama3"))
+	ch, err := p.Stream(context.Background(), gage.Request{
+		Messages: []gage.Message{gage.UserText("hi")},
+		Options: gage.GenerateOptions{
+			ReasoningEffort: gage.ReasoningHigh,
+			ResponseFormat: &gage.ResponseFormat{
+				Type:   gage.ResponseJSONSchema,
+				Schema: gage.JSONSchema(`{"type":"object","properties":{"x":{"type":"integer"}}}`),
+			},
+			Extra: map[string]any{"keep_alive": "5m"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range ch {
+	}
+	var body map[string]any
+	if err := json.Unmarshal(reqBody, &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["think"] != true {
+		t.Fatalf("think = %v", body["think"])
+	}
+	format, _ := body["format"].(map[string]any)
+	if format == nil || format["type"] != "object" {
+		t.Fatalf("format = %v", body["format"])
+	}
+	if body["keep_alive"] != "5m" {
+		t.Fatalf("extra not merged: %v", body["keep_alive"])
+	}
+}
+
+func TestNativeJSONFormat(t *testing.T) {
+	lines := []string{`{"message":{"content":"{}"},"done":true}`}
+	var reqBody []byte
+	srv := ndjsonServer(t, lines, &reqBody)
+	p := New(srv.URL, WithDefaultModel("llama3"))
+	ch, err := p.Stream(context.Background(), gage.Request{
+		Messages: []gage.Message{gage.UserText("hi")},
+		Options:  gage.GenerateOptions{ResponseFormat: &gage.ResponseFormat{Type: gage.ResponseJSON}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range ch {
+	}
+	var body map[string]any
+	json.Unmarshal(reqBody, &body)
+	if body["format"] != "json" {
+		t.Fatalf("format = %v", body["format"])
+	}
+}
+
+func TestNativeToolChoiceUnsupported(t *testing.T) {
+	p := New("http://127.0.0.1:0", WithDefaultModel("llama3"))
+	tc := gage.ToolChoice{Mode: gage.ToolChoiceRequired}
+	_, err := p.Stream(context.Background(), gage.Request{
+		Messages: []gage.Message{gage.UserText("hi")},
+		Options:  gage.GenerateOptions{ToolChoice: &tc},
+	})
+	if !errors.Is(err, gage.ErrUnsupported) {
+		t.Fatalf("err = %v, want ErrUnsupported", err)
+	}
+}
+
+func TestNativeToolResultsCarryToolName(t *testing.T) {
+	msgs := toNativeMessages("", []gage.Message{
+		gage.UserText("q"),
+		{Role: gage.RoleAssistant, Content: []gage.ContentPart{
+			gage.ToolUsePart(gage.ToolCall{ID: "call_0", Name: "list_dir"}),
+			gage.ToolUsePart(gage.ToolCall{ID: "call_1", Name: "read_file"}),
+		}},
+		gage.ToolResultMessage(gage.TextResult("call_0", ".git")),
+		gage.ToolResultMessage(gage.TextResult("call_1", "hello")),
+	})
+	if len(msgs) != 4 {
+		t.Fatalf("msgs = %v", msgs)
+	}
+	if msgs[2]["tool_name"] != "list_dir" || msgs[3]["tool_name"] != "read_file" {
+		t.Fatalf("tool results not correlated: %v / %v", msgs[2], msgs[3])
 	}
 }

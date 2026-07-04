@@ -45,6 +45,15 @@ func (r *MapRegistry) MustRegister(ts ...gage.Tool) {
 	}
 }
 
+// Unregister removes a tool by name, reporting whether it was present.
+func (r *MapRegistry) Unregister(name string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	_, ok := r.tools[name]
+	delete(r.tools, name)
+	return ok
+}
+
 // Get returns the tool with the given name.
 func (r *MapRegistry) Get(name string) (gage.Tool, bool) {
 	r.mu.RLock()
