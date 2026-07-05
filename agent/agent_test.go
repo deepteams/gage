@@ -169,6 +169,36 @@ func TestAgentUnknownTool(t *testing.T) {
 	}
 }
 
+func TestAgentValidatesToolInputBeforeExecute(t *testing.T) {
+	reg := tools.NewRegistry()
+	executed := false
+	reg.MustRegister(tools.Typed("strict_tool", "requires a count", func(ctx context.Context, input struct {
+		Count int `json:"count"`
+	}) (gage.ToolResult, error) {
+		executed = true
+		return gage.TextResult("", "ran"), nil
+	}))
+	mp := &mockProvider{turns: [][]gage.Event{
+		{gage.MessageStart(), toolCallDone("c1", "strict_tool", `{"count":"many"}`), gage.MessageDone(gage.StopToolUse)},
+		{gage.MessageStart(), gage.TextDelta("ok"), gage.MessageDone(gage.StopEndTurn)},
+	}}
+	ag, _ := New(Config{Provider: mp, Registry: reg})
+	ch, _ := ag.Run(context.Background(), []gage.Message{gage.UserText("x")})
+
+	var res *gage.ToolResult
+	for e := range ch {
+		if e.Type == gage.EventToolResult {
+			res = e.ToolResult
+		}
+	}
+	if executed {
+		t.Fatal("tool executed despite invalid arguments")
+	}
+	if res == nil || !res.IsError || !strings.Contains(res.Text(), "invalid arguments") {
+		t.Fatalf("validation result = %+v", res)
+	}
+}
+
 func TestAgentMaxTurns(t *testing.T) {
 	reg := tools.NewRegistry()
 	reg.MustRegister(tools.ToolFuncMust("loop", "loops", func(ctx context.Context, input json.RawMessage) (gage.ToolResult, error) {

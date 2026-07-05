@@ -24,12 +24,26 @@ func NewFileStore(dir string) (gage.SessionStore, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("sessions: create dir: %w", err)
 	}
-	return &fileStore{dir: dir}, nil
+	return &fileStore{dir: dir, codec: plainCodec{}}, nil
+}
+
+// NewEncryptedFileStore returns a SessionStore like NewFileStore, but encrypts
+// each session file with AES-GCM. key must be 16, 24, or 32 bytes.
+func NewEncryptedFileStore(dir string, key []byte) (gage.SessionStore, error) {
+	codec, err := newAESGCMCodec(key)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, fmt.Errorf("sessions: create dir: %w", err)
+	}
+	return &fileStore{dir: dir, codec: codec}, nil
 }
 
 type fileStore struct {
-	dir string
-	mu  sync.Mutex
+	dir   string
+	codec fileCodec
+	mu    sync.Mutex
 }
 
 func validID(id string) error {
@@ -59,6 +73,10 @@ func (f *fileStore) SaveSession(_ context.Context, id string, s gage.Session) er
 	data, err := json.Marshal(s)
 	if err != nil {
 		return fmt.Errorf("sessions: encode: %w", err)
+	}
+	data, err = f.codec.Encode(data)
+	if err != nil {
+		return fmt.Errorf("sessions: encrypt: %w", err)
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -98,6 +116,10 @@ func (f *fileStore) LoadSession(_ context.Context, id string) (gage.Session, err
 	}
 	if err != nil {
 		return gage.Session{}, fmt.Errorf("sessions: read: %w", err)
+	}
+	data, err = f.codec.Decode(data)
+	if err != nil {
+		return gage.Session{}, fmt.Errorf("sessions: decrypt %q: %w", id, err)
 	}
 	var s gage.Session
 	if err := json.Unmarshal(data, &s); err != nil {

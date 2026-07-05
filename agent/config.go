@@ -29,6 +29,10 @@ type Config struct {
 	Approver gage.Approver
 	// Hooks intercept and may alter the run (requests, tool inputs, results).
 	Hooks Hooks
+	// DisableToolInputValidation turns off the built-in JSON Schema validation
+	// performed before tool execution. Validation is on by default and covers
+	// the schema subset emitted by gage's tool helpers.
+	DisableToolInputValidation bool
 	// Observer, if set, receives structured lifecycle observations for audit,
 	// metrics, and tracing. Observer panics are recovered and ignored.
 	Observer Observer

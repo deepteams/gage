@@ -3,7 +3,10 @@ package sessions
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/deepteams/gage"
@@ -79,6 +82,33 @@ func TestFileStore(t *testing.T) {
 		t.Fatal(err)
 	}
 	testStore(t, store)
+}
+
+func TestEncryptedFileStore(t *testing.T) {
+	dir := t.TempDir()
+	key := []byte("0123456789abcdef0123456789abcdef")
+	store, err := NewEncryptedFileStore(dir, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := gage.Session{Messages: []gage.Message{gage.UserText("super secret session")}}
+	if err := store.SaveSession(context.Background(), "s1", want); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, "s1.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "super secret session") {
+		t.Fatalf("encrypted session file contains plaintext: %s", raw)
+	}
+	got, err := store.LoadSession(context.Background(), "s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("round trip mismatch: got %+v want %+v", got, want)
+	}
 }
 
 func TestFileStoreRejectsUnsafeIDs(t *testing.T) {

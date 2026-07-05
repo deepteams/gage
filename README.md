@@ -20,11 +20,13 @@ It gives you, behind clean interfaces:
 - **Memory**: a `MemoryStore` port, in-memory adapter, and
   `memory_remember`/`memory_recall`/`memory_forget` tools.
 - **Agents**: an agentic loop with tool execution (sequential or parallel),
-  permissions (allow/deny/rewrite/remember), hooks, context compaction,
-  sub-agents, aggregated usage, and a terminal `Result`.
-- **Production guards**: per-tool timeouts, panic recovery, structured
-  observations, concurrency and result-size wrappers, SSRF-pinned `web_fetch`,
-  sanitized `bash` environment, and root-confined filesystem tools.
+  permissions (allow/deny/rewrite/remember), JSON Schema tool-input
+  validation, hooks, context compaction, sub-agents, aggregated usage, and a
+  terminal `Result`.
+- **Production guards**: secure policy helpers, per-tool timeouts, panic
+  recovery, structured observations, concurrency and result-size wrappers,
+  SSRF-pinned `web_fetch`, sandboxable/sanitized `bash`, root-confined
+  filesystem tools, encrypted file stores, and durable workflow checkpoints.
 - **HTTP**: an SSE `http.Handler` to expose an agent (you mount it).
 
 ## Architecture
@@ -40,10 +42,12 @@ gage/                 core: Message, Event, Usage, Result + ports (Provider, Too
 │   ├── openai/       reusable Chat Completions + Responses wire formats
 │   └── anthropic/    reusable Messages wire format + API-key provider
 ├── tools/            built-in tools, Typed[T], registry + permission/limit decorators
+├── policy/           conservative Approver policies for secure defaults
 ├── search/           SearchProvider impls (duckduckgo, brave, tavily)
 ├── mcp/              MCP client → gage.Tool bridge (+ resources, prompts, sampling)
 ├── skills/           SKILL.md loader + the "skill" tool
 ├── memory/           in-memory MemoryStore + memory tools
+├── workflow/         durable run/checkpoint persistence around an agent
 ├── jsonschema/       small JSON Schema builder for tool parameters
 ├── agent/            the agentic loop, hooks, compactors, sub-agents
 └── httpx/            SSE handler (no server)
@@ -220,6 +224,16 @@ Gate every execution behind an approver. An approval can carry a denial reason
 (shown to the model), a rewritten input, and a "remember" flag:
 
 ```go
+import "github.com/deepteams/gage/policy"
+
+// Secure allows local read-only filesystem tools and pauses network, shell,
+// writes, MCP, memory mutations and unknown tools for out-of-band approval.
+approver := policy.Secure()
+```
+
+Or provide your own application policy:
+
+```go
 approver := gage.ApproverFunc(func(ctx context.Context, r gage.PermissionRequest) (gage.Approval, error) {
     if r.Metadata.ReadOnly {
         return gage.Approval{Allow: true, Remember: true}, nil
@@ -231,6 +245,10 @@ approver := gage.ApproverFunc(func(ctx context.Context, r gage.PermissionRequest
 // gage.RememberingPerInput caches remembered decisions by tool+arguments.
 ag, _ := agent.New(agent.Config{Provider: p, Registry: reg, Approver: gage.RememberingPerInput(approver)})
 ```
+
+The agent validates tool arguments against each tool's JSON Schema before
+execution by default. Set `agent.Config.DisableToolInputValidation` only when
+you deliberately need raw, schema-incompatible inputs.
 
 `gage.Remembering` is also available when you deliberately want broad caching
 by tool name. For write, shell, network, and other argument-sensitive tools,
@@ -309,9 +327,19 @@ addresses by default, including redirects. For trusted local/internal use only,
 set `tools.WebConfig{AllowPrivateHosts: true}`.
 
 `bash` sanitizes the environment, applies time/output limits, and kills the
-process group on timeout, but it is not an operating-system sandbox. Run
-untrusted shell work inside a container, VM, restricted user, or platform
-sandbox.
+process group on timeout, but direct shell execution is not an operating-system
+sandbox. For untrusted commands, require an external sandbox:
+
+```go
+bash := tools.NewBashTool(tools.BashConfig{
+    RequireSandbox: true,
+    Sandbox: tools.ExternalSandbox{
+        Label:  "firejail",
+        Binary: "firejail",
+        Args:   []string{"--private", "--", "{{shell}}", "-c", "{{command}}"},
+    },
+})
+```
 
 ## Memory
 
@@ -322,10 +350,41 @@ mem := memory.New()
 reg.MustRegister(memory.NewTools(mem)...)
 ```
 
-The built-in store uses simple keyword recall and exact metadata filters, which
+Memories carry optional `namespace`, `user_id`, `provenance`, `sensitivity`,
+`confidence`, `expires_at`, and metadata fields. Recall can be scoped by
+namespace/user and hides expired memories by default. The built-in store uses
+simple keyword recall (or cosine similarity with `memory.NewWithEmbedder`) and
 is useful for tests and local agents. Production systems can implement
 `gage.MemoryStore` with a database, vector index, user-profile service, or
 tenant-scoped memory layer without changing the agent loop.
+
+## Durable Sessions
+
+`sessions.NewFileStore` writes atomic 0600 JSON files. For local encrypted
+storage, use AES-GCM:
+
+```go
+store, _ := sessions.NewEncryptedFileStore("./sessions", key32Bytes)
+```
+
+OAuth helpers have the same option:
+
+```go
+tokenStore, _ := oauth.NewEncryptedFileStore("./tokens/codex.json", key32Bytes)
+```
+
+`workflow.Runner` wraps an agent with a `SessionStore`: completed runs persist
+their full conversation, and paused approval checkpoints are saved so another
+process can resume later.
+
+```go
+runner := workflow.New(ag, store)
+out, err := runner.Run(ctx, "session-1", []gage.Message{gage.UserText("ship it")})
+if errors.Is(err, gage.ErrApprovalPending) {
+    // Persisted already; collect decisions, then:
+    out, err = runner.Resume(ctx, "session-1", decisions)
+}
+```
 
 ## MCP
 
@@ -396,6 +455,4 @@ go test ./... -race
 
 ## License
 
-See [LICENSE](LICENSE). The repository is currently marked all-rights-reserved;
-replace it with MIT, Apache-2.0, or another intended license before publishing
-gage as an open-source library.
+MIT. See [LICENSE](LICENSE).

@@ -130,6 +130,30 @@ func TestBashTimeout(t *testing.T) {
 	}
 }
 
+func TestBashRequireSandbox(t *testing.T) {
+	bash := NewBashTool(BashConfig{RequireSandbox: true})
+	res := run(t, bash, `{"command":"echo hi"}`)
+	if !res.IsError || !strings.Contains(res.Text(), "requires a sandbox") {
+		t.Fatalf("expected sandbox requirement, got %q", res.Text())
+	}
+}
+
+func TestBashExternalSandbox(t *testing.T) {
+	bash := NewBashTool(BashConfig{
+		RequireSandbox: true,
+		Sandbox: ExternalSandbox{
+			Label:  "test-sandbox",
+			Binary: "/bin/bash",
+			Args:   []string{"-c", "{{command}}"},
+			Env:    []string{"GAGE_SANDBOXED=1"},
+		},
+	})
+	res := run(t, bash, `{"command":"echo sandbox:$GAGE_SANDBOXED"}`)
+	if res.IsError || strings.TrimSpace(res.Text()) != "sandbox:1" {
+		t.Fatalf("sandboxed bash = %+v", res)
+	}
+}
+
 func TestGrepAndGlob(t *testing.T) {
 	root := t.TempDir()
 	os.WriteFile(filepath.Join(root, "a.go"), []byte("package main\nfunc Foo() {}\n"), 0o644)

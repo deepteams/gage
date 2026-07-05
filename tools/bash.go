@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 	"time"
 
 	"github.com/deepteams/gage"
@@ -31,6 +32,13 @@ type BashConfig struct {
 	MaxTimeout time.Duration
 	// MaxOutputBytes caps combined stdout+stderr returned (default 256 KiB).
 	MaxOutputBytes int
+	// Sandbox, when set, wraps command execution in an external sandbox runner
+	// such as a container, VM launcher, firejail, bubblewrap, or platform
+	// sandbox. gage still applies timeout, output cap and process-group kill.
+	Sandbox BashSandbox
+	// RequireSandbox makes Execute fail when Sandbox is nil. Use it for agents
+	// that may receive untrusted model instructions.
+	RequireSandbox bool
 }
 
 // sanitizedEnvVars are the parent variables copied into the default command
@@ -81,6 +89,77 @@ func (c BashConfig) maxOutput() int {
 // NewBashTool returns the bash tool.
 func NewBashTool(cfg BashConfig) gage.Tool { return &bashTool{cfg} }
 
+// BashInvocation is the command payload passed to a BashSandbox.
+type BashInvocation struct {
+	Command string
+	Shell   string
+	Dir     string
+	Env     []string
+}
+
+// BashSandbox constructs the process that should execute a bash invocation.
+// Implementations should return an *exec.Cmd that runs inside a real external
+// isolation boundary. The bash tool owns stdout/stderr, cancellation, timeout,
+// and process-group termination around the returned command.
+type BashSandbox interface {
+	Name() string
+	Command(ctx context.Context, inv BashInvocation) (*exec.Cmd, error)
+}
+
+// ExternalSandbox wraps bash execution in a caller-provided binary. Args may
+// contain {{shell}}, {{command}}, and {{dir}} placeholders. If neither
+// {{shell}} nor {{command}} appears, the invocation is appended as
+// "<shell> -c <command>" after Args.
+type ExternalSandbox struct {
+	Label  string
+	Binary string
+	Args   []string
+	Env    []string
+	Dir    string
+}
+
+func (s ExternalSandbox) Name() string {
+	if s.Label != "" {
+		return s.Label
+	}
+	return s.Binary
+}
+
+func (s ExternalSandbox) Command(ctx context.Context, inv BashInvocation) (*exec.Cmd, error) {
+	if s.Binary == "" {
+		return nil, fmt.Errorf("sandbox binary is required")
+	}
+	args, hasInvocation := expandSandboxArgs(s.Args, inv)
+	if !hasInvocation {
+		args = append(args, inv.Shell, "-c", inv.Command)
+	}
+	cmd := exec.CommandContext(ctx, s.Binary, args...)
+	cmd.Dir = inv.Dir
+	if s.Dir != "" {
+		cmd.Dir = s.Dir
+	}
+	cmd.Env = append(append([]string(nil), inv.Env...), s.Env...)
+	return cmd, nil
+}
+
+func expandSandboxArgs(args []string, inv BashInvocation) ([]string, bool) {
+	out := make([]string, len(args))
+	used := false
+	for i, arg := range args {
+		arg = strings.ReplaceAll(arg, "{{shell}}", inv.Shell)
+		if strings.Contains(arg, "{{command}}") {
+			used = true
+		}
+		arg = strings.ReplaceAll(arg, "{{command}}", inv.Command)
+		arg = strings.ReplaceAll(arg, "{{dir}}", inv.Dir)
+		if strings.Contains(args[i], "{{shell}}") {
+			used = true
+		}
+		out[i] = arg
+	}
+	return out, used
+}
+
 type bashTool struct{ cfg BashConfig }
 
 func (t *bashTool) Name() string { return "bash" }
@@ -117,9 +196,10 @@ func (t *bashTool) Execute(ctx context.Context, input json.RawMessage) (gage.Too
 	cctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(cctx, t.cfg.shell(), "-c", args.Command)
-	cmd.Dir = t.cfg.Dir
-	cmd.Env = t.cfg.env()
+	cmd, err := t.command(cctx, args.Command)
+	if err != nil {
+		return gage.ErrorResult("", err.Error()), nil
+	}
 	var buf bytes.Buffer
 	cmd.Stdout = &buf
 	cmd.Stderr = &buf
@@ -128,7 +208,7 @@ func (t *bashTool) Execute(ctx context.Context, input json.RawMessage) (gage.Too
 	// timeout or keep Wait blocked on inherited pipes.
 	configureProcessGroup(cmd)
 
-	err := cmd.Run()
+	err = cmd.Run()
 	out := buf.Bytes()
 	if max := t.cfg.maxOutput(); len(out) > max {
 		out = append(out[:max], []byte("\n... (output truncated)")...)
@@ -145,4 +225,33 @@ func (t *bashTool) Execute(ctx context.Context, input json.RawMessage) (gage.Too
 		text = "(no output)"
 	}
 	return gage.TextResult("", text), nil
+}
+
+func (t *bashTool) command(ctx context.Context, command string) (*exec.Cmd, error) {
+	inv := BashInvocation{
+		Command: command,
+		Shell:   t.cfg.shell(),
+		Dir:     t.cfg.Dir,
+		Env:     t.cfg.env(),
+	}
+	var cmd *exec.Cmd
+	var err error
+	if t.cfg.Sandbox != nil {
+		cmd, err = t.cfg.Sandbox.Command(ctx, inv)
+		if err != nil {
+			return nil, fmt.Errorf("sandbox %s: %w", t.cfg.Sandbox.Name(), err)
+		}
+	} else {
+		if t.cfg.RequireSandbox {
+			return nil, fmt.Errorf("bash requires a sandbox but none is configured")
+		}
+		cmd = exec.CommandContext(ctx, inv.Shell, "-c", inv.Command)
+	}
+	if cmd.Dir == "" {
+		cmd.Dir = inv.Dir
+	}
+	if cmd.Env == nil {
+		cmd.Env = inv.Env
+	}
+	return cmd, nil
 }

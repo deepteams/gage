@@ -48,12 +48,23 @@ func (m *MemoryStore) Save(ctx context.Context, c gage.Credentials) error {
 // as a convenience; consumers may implement gage.TokenStore differently (DB,
 // keychain, ...). The file is written with 0600 permissions.
 type FileStore struct {
-	Path string
-	mu   sync.Mutex
+	Path  string
+	codec tokenCodec
+	mu    sync.Mutex
 }
 
 // NewFileStore returns a FileStore writing to path.
-func NewFileStore(path string) *FileStore { return &FileStore{Path: path} }
+func NewFileStore(path string) *FileStore { return &FileStore{Path: path, codec: plainTokenCodec{}} }
+
+// NewEncryptedFileStore returns a FileStore that encrypts credentials with
+// AES-GCM before writing them to disk. key must be 16, 24, or 32 bytes.
+func NewEncryptedFileStore(path string, key []byte) (*FileStore, error) {
+	codec, err := newTokenAESGCMCodec(key)
+	if err != nil {
+		return nil, err
+	}
+	return &FileStore{Path: path, codec: codec}, nil
+}
 
 func (f *FileStore) Load(ctx context.Context) (gage.Credentials, error) {
 	f.mu.Lock()
@@ -64,6 +75,10 @@ func (f *FileStore) Load(ctx context.Context) (gage.Credentials, error) {
 			return gage.Credentials{}, fmt.Errorf("oauth: credentials file %s not found: %w", f.Path, gage.ErrAuth)
 		}
 		return gage.Credentials{}, fmt.Errorf("oauth: read credentials: %w", err)
+	}
+	b, err = f.codec.Decode(b)
+	if err != nil {
+		return gage.Credentials{}, fmt.Errorf("oauth: decrypt credentials: %w", err)
 	}
 	var c gage.Credentials
 	if err := json.Unmarshal(b, &c); err != nil {
@@ -83,6 +98,10 @@ func (f *FileStore) Save(ctx context.Context, c gage.Credentials) error {
 	b, err := json.MarshalIndent(c, "", "  ")
 	if err != nil {
 		return err
+	}
+	b, err = f.codec.Encode(b)
+	if err != nil {
+		return fmt.Errorf("oauth: encrypt credentials: %w", err)
 	}
 	tmp := f.Path + ".tmp"
 	if err := os.WriteFile(tmp, b, 0o600); err != nil {

@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -164,6 +166,32 @@ func TestFileStoreRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	if out.AccessToken != "a" || out.AccountID != "acct" {
+		t.Fatalf("out = %+v", out)
+	}
+}
+
+func TestEncryptedFileStoreRoundTrip(t *testing.T) {
+	path := t.TempDir() + "/auth.json"
+	fs, err := NewEncryptedFileStore(path, []byte("0123456789abcdef0123456789abcdef"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := gage.Credentials{AccessToken: "secret-access", RefreshToken: "secret-refresh", AccountID: "acct"}
+	if err := fs.Save(context.Background(), in); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "secret-access") || strings.Contains(string(raw), "secret-refresh") {
+		t.Fatalf("encrypted credentials contain plaintext: %s", raw)
+	}
+	out, err := fs.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.AccessToken != in.AccessToken || out.RefreshToken != in.RefreshToken || out.AccountID != in.AccountID {
 		t.Fatalf("out = %+v", out)
 	}
 }

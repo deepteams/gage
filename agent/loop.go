@@ -701,6 +701,11 @@ func (a *Agent) execTool(ctx context.Context, runID string, turn int, tc gage.To
 			approval = gage.Allowed()
 			break
 		}
+		if !a.cfg.DisableToolInputValidation {
+			if err := gage.ValidateToolInput(tool.Schema(), nonEmptyInput(tc.Input)); err != nil {
+				return gage.ErrorResult(tc.ID, "invalid arguments for tool "+tc.Name+": "+err.Error()), false
+			}
+		}
 		var err error
 		approval, err = a.cfg.Approver.Approve(ctx, gage.PermissionRequest{
 			Tool:     tc.Name,
@@ -728,6 +733,11 @@ func (a *Agent) execTool(ctx context.Context, runID string, turn int, tc gage.To
 	if approval.UpdatedInput != nil {
 		tc.Input = approval.UpdatedInput
 	}
+	if !a.cfg.DisableToolInputValidation {
+		if err := gage.ValidateToolInput(tool.Schema(), nonEmptyInput(tc.Input)); err != nil {
+			return gage.ErrorResult(tc.ID, "invalid arguments for tool "+tc.Name+": "+err.Error()), false
+		}
+	}
 
 	input := tc.Input
 	if len(input) == 0 {
@@ -743,6 +753,13 @@ func (a *Agent) execTool(ctx context.Context, runID string, turn int, tc gage.To
 	// Ensure the result is correlated with the originating call id.
 	out.result.CallID = tc.ID
 	return out.result, false
+}
+
+func nonEmptyInput(input json.RawMessage) json.RawMessage {
+	if len(input) == 0 {
+		return json.RawMessage("{}")
+	}
+	return input
 }
 
 type toolOutcome struct {

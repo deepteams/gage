@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/deepteams/gage"
 	"github.com/deepteams/gage/jsonschema"
@@ -33,8 +34,14 @@ func (t *rememberTool) Description() string {
 }
 func (t *rememberTool) Schema() gage.JSONSchema {
 	return jsonschema.Object(map[string]jsonschema.Property{
-		"text":     jsonschema.Str("The memory text to store."),
-		"metadata": metadataProp("Optional string metadata to store with the memory."),
+		"text":        jsonschema.Str("The memory text to store."),
+		"metadata":    metadataProp("Optional string metadata to store with the memory."),
+		"namespace":   jsonschema.Str("Tenant, project, or application namespace."),
+		"user_id":     jsonschema.Str("User id this memory belongs to."),
+		"provenance":  jsonschema.Str("Where this memory came from."),
+		"sensitivity": jsonschema.Str("Sensitivity label such as public, private, pii, or secret."),
+		"confidence":  jsonschema.Num("Confidence score from 0 to 1."),
+		"ttl_seconds": jsonschema.Int("Optional lifetime in seconds."),
 	}, "text")
 }
 func (t *rememberTool) Metadata() gage.ToolMetadata {
@@ -54,13 +61,31 @@ func (t *rememberTool) Execute(ctx context.Context, input json.RawMessage) (gage
 		return gage.ErrorResult("", "memory store is nil"), nil
 	}
 	var args struct {
-		Text     string            `json:"text"`
-		Metadata map[string]string `json:"metadata"`
+		Text        string            `json:"text"`
+		Metadata    map[string]string `json:"metadata"`
+		Namespace   string            `json:"namespace"`
+		UserID      string            `json:"user_id"`
+		Provenance  string            `json:"provenance"`
+		Sensitivity string            `json:"sensitivity"`
+		Confidence  float64           `json:"confidence"`
+		TTLSeconds  int               `json:"ttl_seconds"`
 	}
 	if err := json.Unmarshal(input, &args); err != nil {
 		return gage.ToolResult{}, err
 	}
-	m, err := t.store.Remember(ctx, gage.Memory{Text: args.Text, Metadata: args.Metadata})
+	mem := gage.Memory{
+		Text:        args.Text,
+		Metadata:    args.Metadata,
+		Namespace:   args.Namespace,
+		UserID:      args.UserID,
+		Provenance:  args.Provenance,
+		Sensitivity: args.Sensitivity,
+		Confidence:  args.Confidence,
+	}
+	if args.TTLSeconds > 0 {
+		mem.ExpiresAt = time.Now().UTC().Add(time.Duration(args.TTLSeconds) * time.Second)
+	}
+	m, err := t.store.Remember(ctx, mem)
 	if err != nil {
 		return gage.ErrorResult("", err.Error()), nil
 	}
@@ -77,9 +102,12 @@ func (t *recallTool) Description() string {
 }
 func (t *recallTool) Schema() gage.JSONSchema {
 	return jsonschema.Object(map[string]jsonschema.Property{
-		"query":    jsonschema.Str("Search query. Leave empty to list recent memories."),
-		"limit":    jsonschema.Int("Maximum number of memories to return (default 10)."),
-		"metadata": metadataProp("Optional exact-match metadata filters."),
+		"query":           jsonschema.Str("Search query. Leave empty to list recent memories."),
+		"limit":           jsonschema.Int("Maximum number of memories to return (default 10)."),
+		"metadata":        metadataProp("Optional exact-match metadata filters."),
+		"namespace":       jsonschema.Str("Tenant, project, or application namespace."),
+		"user_id":         jsonschema.Str("User id this memory belongs to."),
+		"include_expired": jsonschema.Bool("Include expired memories."),
 	})
 }
 func (t *recallTool) Metadata() gage.ToolMetadata {
@@ -103,14 +131,24 @@ func (t *recallTool) Execute(ctx context.Context, input json.RawMessage) (gage.T
 		return gage.ErrorResult("", "memory store is nil"), nil
 	}
 	var args struct {
-		Query    string            `json:"query"`
-		Limit    int               `json:"limit"`
-		Metadata map[string]string `json:"metadata"`
+		Query          string            `json:"query"`
+		Limit          int               `json:"limit"`
+		Metadata       map[string]string `json:"metadata"`
+		Namespace      string            `json:"namespace"`
+		UserID         string            `json:"user_id"`
+		IncludeExpired bool              `json:"include_expired"`
 	}
 	if err := json.Unmarshal(input, &args); err != nil {
 		return gage.ToolResult{}, err
 	}
-	memories, err := t.store.Recall(ctx, gage.MemoryQuery{Query: args.Query, Limit: args.Limit, Metadata: args.Metadata})
+	memories, err := t.store.Recall(ctx, gage.MemoryQuery{
+		Query:          args.Query,
+		Limit:          args.Limit,
+		Metadata:       args.Metadata,
+		Namespace:      args.Namespace,
+		UserID:         args.UserID,
+		IncludeExpired: args.IncludeExpired,
+	})
 	if err != nil {
 		return gage.ErrorResult("", err.Error()), nil
 	}

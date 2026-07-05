@@ -94,6 +94,52 @@ func TestSemanticRecallBeatsKeywordOrder(t *testing.T) {
 	}
 }
 
+func TestRecallScopesAndExpiration(t *testing.T) {
+	store := New()
+	ctx := context.Background()
+	expiredAt := time.Now().Add(-time.Minute)
+	active, err := store.Remember(ctx, gage.Memory{
+		Text:      "deploy key rotation",
+		Namespace: "project-a",
+		UserID:    "u1",
+		CreatedAt: time.Unix(100, 0),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Remember(ctx, gage.Memory{
+		Text:      "deploy key rotation",
+		Namespace: "project-b",
+		UserID:    "u1",
+		CreatedAt: time.Unix(200, 0),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Remember(ctx, gage.Memory{
+		Text:      "deploy key rotation",
+		Namespace: "project-a",
+		UserID:    "u2",
+		ExpiresAt: expiredAt,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := store.Recall(ctx, gage.MemoryQuery{Query: "deploy", Namespace: "project-a", UserID: "u1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].ID != active.ID {
+		t.Fatalf("scoped recall = %+v, want %s", got, active.ID)
+	}
+	got, err = store.Recall(ctx, gage.MemoryQuery{Query: "deploy", Namespace: "project-a", IncludeExpired: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("include expired recall = %+v, want 2 memories", got)
+	}
+}
+
 func TestSemanticRecallLimit(t *testing.T) {
 	store, _ := semanticStore(t)
 

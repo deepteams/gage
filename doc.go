@@ -14,6 +14,7 @@
 //     failover. providers/openai.Embeddings and providers/ollama.Embedder
 //     implement Embedder.
 //   - tools implements the built-in Tool set, Typed tools, and a ToolRegistry.
+//   - policy provides conservative Approver implementations for secure defaults.
 //   - search implements SearchProvider (duckduckgo, brave, tavily).
 //   - mcp bridges Model Context Protocol servers into Tools (plus resources,
 //     prompts, and sampling).
@@ -23,6 +24,8 @@
 //   - jsonschema builds JSON Schema documents for tool parameters.
 //   - sessions implements SessionStore (in-memory and JSON files).
 //   - agent runs the agentic loop and streams Events.
+//   - workflow persists completed sessions and paused approval checkpoints
+//     around an agent.
 //   - structured decodes model output into typed Go values (Generate[T]).
 //   - pricing ships a dated per-model rate table for Pricing.Cost.
 //   - gagetest provides a scripted Provider for testing agents offline.

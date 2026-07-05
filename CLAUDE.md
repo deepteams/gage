@@ -44,6 +44,10 @@ Everything streams end to end via `<-chan gage.Event`.
     `/embeddings` endpoint) and `ollama.Embedder`.
   - `tools/` — built-in tools, `Typed[T]` reflected tools, `MapRegistry`, the
     permission `Guard`, and the `LimitConcurrency`/`LimitResultSize` wrappers.
+    `bash` can be configured with `RequireSandbox` and a `BashSandbox`
+    implementation for external isolation.
+  - `policy/` — conservative `Approver` implementations, including
+    `policy.Secure()` for allow-local-read / pause-sensitive defaults.
   - `search/` — `SearchProvider` impls (duckduckgo has no key).
   - `mcp/` — wraps `github.com/modelcontextprotocol/go-sdk`; adapts MCP tools to
     `gage.Tool`, plus resources, prompts, `tools/list_changed` sync, and
@@ -53,8 +57,11 @@ Everything streams end to end via `<-chan gage.Event`.
     `memory_recall`, and `memory_forget` tools; `NewWithEmbedder` upgrades
     recall to cosine-similarity ranking (keyword fallback on embed failure).
   - `sessions/` — `SessionStore` impls (in-memory, JSON file store).
+    File stores can be encrypted with AES-GCM via `NewEncryptedFileStore`.
   - `agent/` — the loop (`loop.go`), config, hooks, compactors, sub-agents,
     pause/resume (`Resume`, `*Paused`).
+  - `workflow/` — durable runner around an agent and `SessionStore`; persists
+    completed conversations and paused approval checkpoints for later resume.
   - `httpx/` — SSE handler.
   - `jsonschema/` — JSON Schema builder for tool params (public).
   - `structured/` — typed structured output: `Generate[T]` (reflected strict
@@ -111,6 +118,8 @@ returned `ErrApprovalPending`; the caller persists the checkpoint (see
 - Tool-level failures are returned as a `ToolResult` with `IsError: true` (so
   the model sees them), **not** as a Go `error`. Reserve the `error` return for
   infrastructure failures.
+- The agent validates tool inputs against each tool's JSON Schema by default;
+  use `DisableToolInputValidation` only for deliberate raw-input compatibility.
 - Tool metadata is advisory and optional. Use `gage.ToolMetadataProvider` and
   `gage.ToolCallDescriber` to enrich client approval/audit UX, but keep policy
   decisions in caller-provided `Approver`s.
@@ -134,6 +143,9 @@ returned `ErrApprovalPending`; the caller persists the checkpoint (see
 - Built-in filesystem and web tools are security-sensitive. Keep root
   confinement symlink-safe, and keep `web_fetch` private-host blocking enabled
   by default unless the caller explicitly opts into trusted local/internal use.
+- For untrusted shell execution, require `tools.BashConfig.RequireSandbox` with
+  a real external sandbox. Direct `bash` remains useful for trusted local
+  developer agents, but it is not an OS sandbox.
 - Streaming goroutines own closing their output channel and always `select` on
   `ctx.Done()` when sending.
 - Keep dependencies minimal: stdlib + `modelcontextprotocol/go-sdk` (MCP) +

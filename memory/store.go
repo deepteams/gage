@@ -58,6 +58,9 @@ func (s *Store) Remember(ctx context.Context, m gage.Memory) (gage.Memory, error
 	if strings.TrimSpace(m.Text) == "" {
 		return gage.Memory{}, fmt.Errorf("memory: text is required")
 	}
+	if m.Confidence < 0 || m.Confidence > 1 {
+		return gage.Memory{}, fmt.Errorf("memory: confidence must be between 0 and 1")
+	}
 	// Embed outside the lock: Embed does I/O.
 	var vec []float32
 	if s.embedder != nil {
@@ -119,6 +122,7 @@ func (s *Store) Recall(ctx context.Context, q gage.MemoryQuery) ([]gage.Memory, 
 func (s *Store) recallSemantic(ctx context.Context, q gage.MemoryQuery, qvec []float32, limit int) ([]gage.Memory, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	now := time.Now().UTC()
 
 	type scored struct {
 		m     gage.Memory
@@ -129,7 +133,7 @@ func (s *Store) recallSemantic(ctx context.Context, q gage.MemoryQuery, qvec []f
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		if !metadataMatches(m.Metadata, q.Metadata) {
+		if !memoryMatches(m, q, now) {
 			continue
 		}
 		score := math.Inf(-1)
@@ -161,6 +165,7 @@ func (s *Store) recallSemantic(ctx context.Context, q gage.MemoryQuery, qvec []f
 func (s *Store) recallKeyword(ctx context.Context, q gage.MemoryQuery, limit int) ([]gage.Memory, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	now := time.Now().UTC()
 
 	type scored struct {
 		m     gage.Memory
@@ -171,7 +176,7 @@ func (s *Store) recallKeyword(ctx context.Context, q gage.MemoryQuery, limit int
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		if !metadataMatches(m.Metadata, q.Metadata) {
+		if !memoryMatches(m, q, now) {
 			continue
 		}
 		score := memoryScore(q.Query, m)
@@ -239,7 +244,14 @@ func memoryScore(query string, m gage.Memory) int {
 	if query == "" {
 		return 1
 	}
-	haystack := strings.ToLower(m.Text + " " + metadataString(m.Metadata))
+	haystack := strings.ToLower(strings.Join([]string{
+		m.Text,
+		m.Namespace,
+		m.UserID,
+		m.Provenance,
+		m.Sensitivity,
+		metadataString(m.Metadata),
+	}, " "))
 	score := 0
 	if strings.Contains(haystack, query) {
 		score += 10
@@ -250,6 +262,19 @@ func memoryScore(query string, m gage.Memory) int {
 		}
 	}
 	return score
+}
+
+func memoryMatches(m gage.Memory, q gage.MemoryQuery, now time.Time) bool {
+	if q.Namespace != "" && m.Namespace != q.Namespace {
+		return false
+	}
+	if q.UserID != "" && m.UserID != q.UserID {
+		return false
+	}
+	if !q.IncludeExpired && !m.ExpiresAt.IsZero() && !m.ExpiresAt.After(now) {
+		return false
+	}
+	return metadataMatches(m.Metadata, q.Metadata)
 }
 
 func metadataMatches(have, want map[string]string) bool {
