@@ -33,6 +33,7 @@ type appRuntime struct {
 	sessionID    string
 	store        gage.SessionStore
 	history      []gage.Message
+	pending      *gage.Checkpoint
 	snapshots    *snapshotManager
 	formatters   *formatterManager
 	todos        *todoStore
@@ -40,6 +41,7 @@ type appRuntime struct {
 	approval     approvalAsker
 	questioner   questionAsker
 	auto         bool
+	readOnly     bool
 	mcpClients   []*mcp.Client
 	mcpTools     []gage.Tool
 }
@@ -79,7 +81,7 @@ func newRuntime(ctx context.Context, root, model, sessionID, skillsDir, configPa
 	if err != nil {
 		return nil, err
 	}
-	history, store, err := loadSession(ctx, absRoot, sessionID)
+	history, pending, store, err := loadSession(ctx, absRoot, sessionID)
 	if err != nil {
 		return nil, err
 	}
@@ -97,6 +99,7 @@ func newRuntime(ctx context.Context, root, model, sessionID, skillsDir, configPa
 		sessionID:    sessionID,
 		store:        store,
 		history:      history,
+		pending:      pending,
 		snapshots:    newSnapshotManager(absRoot),
 		formatters:   newFormatterManager(absRoot, cfg.Formatters),
 		todos:        newTodoStore(),
@@ -117,14 +120,25 @@ func (a *appRuntime) SetInteractors(approval approvalAsker, question questionAsk
 	a.approval = approval
 	a.questioner = question
 	a.auto = auto
-	a.approver = gage.RememberingPerInput(&configuredApprover{
-		policy: a.policy,
-		auto:   auto,
-		asker:  approval,
+	// Two remembered scopes compose here: the inner toolMemoryApprover caches
+	// tool-wide 't' answers, and gage.RememberingPerInput caches exact-input
+	// 'a' answers (Approval.Remember).
+	a.approver = gage.RememberingPerInput(&toolMemoryApprover{
+		inner: &configuredApprover{
+			policy: a.policy,
+			auto:   auto,
+			asker:  approval,
+		},
+		byTool: map[string]gage.Approval{},
 	})
 }
 
 func (a *appRuntime) RunPrompt(ctx context.Context, prompt string, mode agentMode, emit func(gage.Event)) (*gage.Result, string, error) {
+	if a.pending != nil {
+		// The paused assistant message carries tool calls without results;
+		// sending it as-is in a fresh run would be an invalid conversation.
+		return nil, "", errors.New("a paused run is awaiting decisions: /resume to continue it, or /clear to drop it")
+	}
 	ag, err := a.newAgent(mode)
 	if err != nil {
 		return nil, "", err
@@ -138,6 +152,85 @@ func (a *appRuntime) RunPrompt(ctx context.Context, prompt string, mode agentMod
 		return nil, "", err
 	}
 
+	res, paused, runErr := drainRun(stream, emit)
+
+	if runErr != nil {
+		// The turn failed mid-flight. Commit (not discard) any file changes the
+		// tools already applied so /undo can still revert them, then drop the
+		// dangling user message so the conversation stays consistent.
+		a.snapshots.Commit()
+		a.history = a.history[:len(a.history)-1]
+		return nil, "", runErr
+	}
+	if paused != nil {
+		return nil, a.stashPause(ctx, paused), nil
+	}
+	if res == nil {
+		a.history = a.history[:len(a.history)-1]
+		a.snapshots.Discard()
+		return nil, "", nil
+	}
+	return res, a.settleResult(ctx, res), nil
+}
+
+// RunResume continues the pending checkpoint: it re-asks a decision for every
+// still-pending tool call (through the same policy + interactive approver as a
+// live run), then resumes the agent with the recorded decisions. Calls
+// postponed again leave the run paused.
+func (a *appRuntime) RunResume(ctx context.Context, mode agentMode, emit func(gage.Event)) (*gage.Result, string, error) {
+	cp := a.pending
+	if cp == nil {
+		return nil, "", errors.New("no paused checkpoint (postpone an approval with 'p' to create one)")
+	}
+	ag, err := a.newAgent(mode)
+	if err != nil {
+		return nil, "", err
+	}
+	decisions := map[string]gage.Approval{}
+	for _, tc := range cp.Pending() {
+		req := gage.PermissionRequest{
+			Tool:    tc.Name,
+			Input:   tc.Input,
+			Agent:   "gage-coding/" + string(mode),
+			Turn:    cp.Turn,
+			Summary: tc.Name + " " + toolInputString(tc.Input, 160),
+		}
+		ap, err := a.approver.Approve(ctx, req)
+		if errors.Is(err, gage.ErrApprovalPending) {
+			continue // postponed again; Resume keeps it pending
+		}
+		if err != nil {
+			return nil, "", err
+		}
+		decisions[tc.ID] = ap
+	}
+
+	a.snapshots.Begin("resume paused run")
+	stream, err := ag.Resume(ctx, cp, decisions)
+	if err != nil {
+		a.snapshots.Discard()
+		return nil, "", err
+	}
+
+	res, paused, runErr := drainRun(stream, emit)
+
+	if runErr != nil {
+		a.snapshots.Commit()
+		return nil, "", runErr
+	}
+	if paused != nil {
+		return nil, a.stashPause(ctx, paused), nil
+	}
+	if res == nil {
+		a.snapshots.Discard()
+		return nil, "", nil
+	}
+	a.pending = nil
+	return res, a.settleResult(ctx, res), nil
+}
+
+// drainRun relays every event to emit and collects the terminal outcome.
+func drainRun(stream <-chan gage.Event, emit func(gage.Event)) (*gage.Result, *gage.Checkpoint, error) {
 	var res *gage.Result
 	var paused *gage.Checkpoint
 	var runErr error
@@ -154,39 +247,31 @@ func (a *appRuntime) RunPrompt(ctx context.Context, prompt string, mode agentMod
 			runErr = ev.Err
 		}
 	}
+	return res, paused, runErr
+}
 
-	if runErr != nil {
-		// The turn failed mid-flight. Commit (not discard) any file changes the
-		// tools already applied so /undo can still revert them, then drop the
-		// dangling user message so the conversation stays consistent.
-		a.snapshots.Commit()
-		a.history = a.history[:len(a.history)-1]
-		return nil, "", runErr
-	}
-
-	if paused != nil {
-		// The approver deferred the decision (ErrApprovalPending). Keep the
-		// applied changes undoable, align in-memory history with the checkpoint
-		// we persist, and tell the user instead of silently swallowing the run.
-		a.snapshots.Commit()
-		a.history = paused.Messages
-		if a.store != nil {
-			if err := a.store.SaveSession(ctx, a.sessionID, gage.Session{
-				Messages:   paused.Messages,
-				Checkpoint: paused,
-			}); err != nil {
-				return nil, "", fmt.Errorf("save paused checkpoint: %w", err)
-			}
+// stashPause records a paused checkpoint: keep the applied changes undoable,
+// align in-memory history with what we persist, and tell the user how to
+// continue instead of silently swallowing the run.
+func (a *appRuntime) stashPause(ctx context.Context, paused *gage.Checkpoint) string {
+	a.snapshots.Commit()
+	a.pending = paused
+	a.history = paused.Messages
+	msg := "run paused awaiting approval · /resume to decide"
+	if a.store != nil {
+		if err := a.store.SaveSession(ctx, a.sessionID, gage.Session{
+			Messages:   paused.Messages,
+			Checkpoint: paused,
+		}); err != nil {
+			msg += fmt.Sprintf(" · warning: checkpoint not saved: %v", err)
+		} else {
+			msg += " (checkpoint saved)"
 		}
-		return nil, "run paused awaiting approval; checkpoint saved", nil
 	}
+	return msg
+}
 
-	if res == nil {
-		a.history = a.history[:len(a.history)-1]
-		a.snapshots.Discard()
-		return nil, "", nil
-	}
-
+func (a *appRuntime) settleResult(ctx context.Context, res *gage.Result) string {
 	a.history = res.Messages
 	changed := a.snapshots.Commit()
 	summary := runSummary(res, a.modelID)
@@ -200,7 +285,7 @@ func (a *appRuntime) RunPrompt(ctx context.Context, prompt string, mode agentMod
 			summary += fmt.Sprintf(" · warning: session not saved: %v", err)
 		}
 	}
-	return res, summary, nil
+	return summary
 }
 
 func (a *appRuntime) newAgent(mode agentMode) (*agent.Agent, error) {
@@ -245,7 +330,7 @@ func (a *appRuntime) toolsForMode(mode agentMode) []gage.Tool {
 	all = append(all, tools.NewFSTools(fsCfg)...)
 	all = wrapMutations(all, a.snapshots, a.formatters)
 	all = append(all, tools.NewSearchTools(fsCfg)...)
-	if mode != modePlan {
+	if mode != modePlan && !a.readOnly {
 		all = append(all, tools.NewBashTool(tools.BashConfig{Dir: a.root}))
 	}
 	all = append(all, tools.NewWebTools(tools.WebConfig{Search: duckduckgo.New()})...)
@@ -257,17 +342,25 @@ func (a *appRuntime) toolsForMode(mode agentMode) []gage.Tool {
 	if explore, err := newExplorerTool(a.provider, a.root); err == nil {
 		all = append(all, explore)
 	}
-	if mode != modePlan {
+	if mode != modePlan && !a.readOnly {
 		all = append(all, a.mcpTools...)
 	}
 
 	filtered := all[:0]
 	for _, t := range all {
-		if toolAllowedInMode(mode, t) && a.toolEnabled(t) {
+		if toolAllowedInMode(mode, t) && a.toolEnabled(t) && !a.toolBlockedByReadOnly(t) {
 			filtered = append(filtered, t)
 		}
 	}
 	return filtered
+}
+
+func (a *appRuntime) toolBlockedByReadOnly(t gage.Tool) bool {
+	if !a.readOnly {
+		return false
+	}
+	meta := gage.MetadataOf(t)
+	return meta.Shell || meta.Destructive || (meta.Filesystem && !meta.ReadOnly) || meta.RequiresApproval
 }
 
 func toolAllowedInMode(mode agentMode, t gage.Tool) bool {
@@ -438,6 +531,9 @@ type slashResult struct {
 	SetMode  *agentMode
 	Quit     bool
 	ClearLog bool
+	// Resume asks the caller to run RunResume on the pending checkpoint (it
+	// streams and prompts, so the slash handler cannot do it inline).
+	Resume bool
 }
 
 func (a *appRuntime) HandleSlash(ctx context.Context, line string, current agentMode) (slashResult, error) {
@@ -452,6 +548,16 @@ func (a *appRuntime) HandleSlash(ctx context.Context, line string, current agent
 		return slashResult{Quit: true}, nil
 	case "help", "?":
 		return slashResult{Output: a.helpText()}, nil
+	case "status":
+		return slashResult{Output: a.statusText(current)}, nil
+	case "root":
+		return slashResult{Output: a.root}, nil
+	case "model":
+		return slashResult{Output: a.modelText()}, nil
+	case "config":
+		return slashResult{Output: a.configText()}, nil
+	case "permissions", "permission":
+		return slashResult{Output: a.permissionsText()}, nil
 	case "mode":
 		if args == "" {
 			return slashResult{Output: fmt.Sprintf("current mode: %s\navailable: %s", current, strings.Join(modeNames(), ", "))}, nil
@@ -471,14 +577,27 @@ func (a *appRuntime) HandleSlash(ctx context.Context, line string, current agent
 		return slashResult{Output: "reloaded config, skills, commands, and instructions"}, a.Reload(ctx)
 	case "clear":
 		a.history = nil
+		a.pending = nil
 		if a.store != nil {
 			_ = a.store.SaveSession(ctx, a.sessionID, gage.Session{})
 		}
 		return slashResult{Output: "conversation cleared", ClearLog: true}, nil
+	case "resume":
+		if a.pending == nil {
+			return slashResult{Output: "no paused run to resume (postpone an approval with 'p' to create one)"}, nil
+		}
+		pending := a.pending.Pending()
+		return slashResult{Output: fmt.Sprintf("resuming paused run: %d call(s) awaiting a decision", len(pending)), Resume: true}, nil
 	case "undo":
+		if args == "list" || args == "ls" {
+			return slashResult{Output: a.snapshots.List()}, nil
+		}
 		out, err := a.snapshots.Undo()
 		return slashResult{Output: out}, err
 	case "redo":
+		if args == "list" || args == "ls" {
+			return slashResult{Output: a.snapshots.List()}, nil
+		}
 		out, err := a.snapshots.Redo()
 		return slashResult{Output: out}, err
 	case "tools":
@@ -546,17 +665,111 @@ func (a *appRuntime) Reload(ctx context.Context) error {
 
 func (a *appRuntime) helpText() string {
 	return strings.TrimSpace(`Slash commands:
-  /mode [build|plan|review]  switch agent mode
+  /status                    show model, root, session, mode, skills, commands
+  /mode [build|plan|review]  show or switch agent mode
+  /root                      show the workspace root
+  /model                     show the active model/provider id
+  /config                    show the loaded effective config summary
+  /permissions               show configured permission rules
   /init                      create AGENTS.md starter instructions
   /tools [mode]              list tools visible in a mode
   /skills                    list loaded SKILL.md skills
   /commands                  list custom .agents/commands
-  /undo /redo                revert or reapply tracked write_file/edit changes
+  /undo [list]               revert tracked write_file/edit changes or list stack
+  /redo [list]               reapply the last undo or list stack
+  /resume                    resume a run paused by a postponed approval
+  /sessions                  list persisted sessions when -session is enabled
   /clear                     clear conversation history
   /reload                    reload config, instructions, skills, commands
   /quit                      exit
 
 Custom commands: add .agents/commands/name.md and run /name arguments.`)
+}
+
+func (a *appRuntime) statusText(current agentMode) string {
+	pending := "no"
+	if a.pending != nil {
+		pending = fmt.Sprintf("yes (%d tool call(s))", len(a.pending.Pending()))
+	}
+	session := a.sessionID
+	if session == "" {
+		session = "disabled"
+	}
+	cfg := a.cfg.Path
+	if cfg == "" {
+		cfg = "none"
+	}
+	return strings.TrimSpace(fmt.Sprintf(`gage-coding
+mode: %s
+model: %s
+root: %s
+session: %s
+readonly: %t
+auto approvals: %t
+config: %s
+pending checkpoint: %s
+skills loaded: %d
+custom commands: %d
+mcp tools: %d`, current, a.modelID, a.root, session, a.readOnly, a.auto, cfg, pending, skillCount(a.skillSet), commandCount(a.commands), len(a.mcpTools)))
+}
+
+func (a *appRuntime) modelText() string {
+	return a.modelID
+}
+
+func (a *appRuntime) configText() string {
+	var b strings.Builder
+	path := a.cfg.Path
+	if path == "" {
+		path = "none"
+	}
+	fmt.Fprintf(&b, "path: %s\n", path)
+	fmt.Fprintf(&b, "model: %s\n", valueOr(a.cfg.Model, "provider default"))
+	fmt.Fprintf(&b, "default_mode: %s\n", valueOr(a.cfg.DefaultMode, string(modeBuild)))
+	fmt.Fprintf(&b, "max_turns: %d\n", a.cfg.MaxTurns)
+	fmt.Fprintf(&b, "compact_after: %d\n", a.cfg.CompactAfter)
+	fmt.Fprintf(&b, "tool_timeout: %s\n", a.cfg.ToolTimeout.Duration())
+	fmt.Fprintf(&b, "formatters: %s\n", strings.Join(sortedKeys(a.cfg.Formatters), ", "))
+	fmt.Fprintf(&b, "tools overrides: %s\n", strings.Join(sortedKeys(a.cfg.Tools), ", "))
+	fmt.Fprintf(&b, "mcp servers: %s\n", strings.Join(sortedKeys(a.cfg.MCP), ", "))
+	fmt.Fprintf(&b, "inline commands: %s", strings.Join(sortedKeys(a.cfg.Command), ", "))
+	return strings.TrimSpace(b.String())
+}
+
+func (a *appRuntime) permissionsText() string {
+	if len(a.cfg.Permission) == 0 {
+		return "no permission config loaded"
+	}
+	var v any
+	if err := json.Unmarshal(a.cfg.Permission, &v); err != nil {
+		return "permission config is not valid JSON: " + err.Error()
+	}
+	out, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		return err.Error()
+	}
+	return string(out)
+}
+
+func skillCount(set *skills.Set) int {
+	if set == nil {
+		return 0
+	}
+	return set.Len()
+}
+
+func commandCount(set *commandSet) int {
+	if set == nil {
+		return 0
+	}
+	return len(set.commands)
+}
+
+func valueOr(value, fallback string) string {
+	if value == "" {
+		return fallback
+	}
+	return value
 }
 
 func (a *appRuntime) listTools(mode agentMode) string {
@@ -609,25 +822,24 @@ func (a *appRuntime) listSessions(ctx context.Context) (string, error) {
 	return strings.Join(ids, "\n"), nil
 }
 
-func loadSession(ctx context.Context, root, id string) ([]gage.Message, gage.SessionStore, error) {
+func loadSession(ctx context.Context, root, id string) ([]gage.Message, *gage.Checkpoint, gage.SessionStore, error) {
 	if id == "" {
-		return nil, nil, nil
+		return nil, nil, nil, nil
 	}
 	store, err := sessions.NewFileStore(filepath.Join(root, ".gage-coding"))
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	s, err := store.LoadSession(ctx, id)
 	switch {
 	case errors.Is(err, gage.ErrSessionNotFound):
-		return nil, store, nil
+		return nil, nil, store, nil
 	case err != nil:
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	if s.Checkpoint != nil {
-		fmt.Println("note: dropping a paused checkpoint from a previous run")
-	}
-	return s.Messages, store, nil
+	// A non-nil checkpoint means a previous run paused on a postponed approval;
+	// keep it so the user can /resume it instead of silently dropping it.
+	return s.Messages, s.Checkpoint, store, nil
 }
 
 func runSummary(res *gage.Result, model string) string {

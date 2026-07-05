@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -117,36 +119,112 @@ func (s *snapshotManager) RecordAfter(path string) error {
 }
 
 func (s *snapshotManager) Undo() (string, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if len(s.undo) == 0 {
-		return "nothing to undo", nil
-	}
-	cs := s.undo[len(s.undo)-1]
-	// Apply before mutating the stacks: if a write fails partway (e.g. a file
-	// was made read-only), leave the changeset on the undo stack so the user can
-	// fix the cause and retry instead of losing the recorded states.
-	if err := s.apply(cs, false); err != nil {
-		return "", err
-	}
-	s.undo = s.undo[:len(s.undo)-1]
-	s.redo = append(s.redo, cs)
-	return fmt.Sprintf("undid %d file change(s) from: %s", len(cs.Changes), cs.Prompt), nil
+	return s.applyTop(false)
 }
 
 func (s *snapshotManager) Redo() (string, error) {
+	return s.applyTop(true)
+}
+
+func (s *snapshotManager) List() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if len(s.redo) == 0 {
-		return "nothing to redo", nil
+	if len(s.undo) == 0 && len(s.redo) == 0 {
+		return "no tracked changes"
 	}
-	cs := s.redo[len(s.redo)-1]
-	if err := s.apply(cs, true); err != nil {
+	var b strings.Builder
+	if len(s.undo) > 0 {
+		fmt.Fprintln(&b, "undo stack:")
+		for i := len(s.undo) - 1; i >= 0; i-- {
+			fmt.Fprintf(&b, "  %d. %s (%s)\n", len(s.undo)-i, s.undo[i].Prompt, strings.Join(changePaths(s.undo[i]), ", "))
+		}
+	}
+	if len(s.redo) > 0 {
+		if b.Len() > 0 {
+			b.WriteByte('\n')
+		}
+		fmt.Fprintln(&b, "redo stack:")
+		for i := len(s.redo) - 1; i >= 0; i-- {
+			fmt.Fprintf(&b, "  %d. %s (%s)\n", len(s.redo)-i, s.redo[i].Prompt, strings.Join(changePaths(s.redo[i]), ", "))
+		}
+	}
+	return strings.TrimSpace(b.String())
+}
+
+func (s *snapshotManager) applyTop(redo bool) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	stack := s.undo
+	action := "undo"
+	past := "undid"
+	if redo {
+		stack = s.redo
+		action = "redo"
+		past = "redid"
+	}
+	if len(stack) == 0 {
+		return "nothing to " + action, nil
+	}
+	cs := stack[len(stack)-1]
+	if err := s.checkCurrentState(cs, redo); err != nil {
 		return "", err
 	}
-	s.redo = s.redo[:len(s.redo)-1]
-	s.undo = append(s.undo, cs)
-	return fmt.Sprintf("redid %d file change(s) from: %s", len(cs.Changes), cs.Prompt), nil
+	// Apply before mutating the stacks: if a write fails partway (e.g. a file
+	// was made read-only), leave the changeset on the stack so the user can fix
+	// the cause and retry instead of losing the recorded states.
+	if err := s.apply(cs, redo); err != nil {
+		return "", err
+	}
+	if redo {
+		s.redo = s.redo[:len(s.redo)-1]
+		s.undo = append(s.undo, cs)
+	} else {
+		s.undo = s.undo[:len(s.undo)-1]
+		s.redo = append(s.redo, cs)
+	}
+	return fmt.Sprintf("%s %d file change(s) from: %s\n%s", past, len(cs.Changes), cs.Prompt, formatChangePaths(cs)), nil
+}
+
+func (s *snapshotManager) checkCurrentState(cs *changeSet, redo bool) error {
+	for _, change := range cs.Changes {
+		want := change.After
+		if redo {
+			want = change.Before
+		}
+		abs, _, err := s.resolve(change.Path)
+		if err != nil {
+			return err
+		}
+		got, err := readFileState(abs)
+		if err != nil {
+			return err
+		}
+		if !sameFileState(got, want) {
+			return fmt.Errorf("refusing to apply snapshot: %s changed since it was recorded", change.Path)
+		}
+	}
+	return nil
+}
+
+func changePaths(cs *changeSet) []string {
+	paths := make([]string, 0, len(cs.Changes))
+	for p := range cs.Changes {
+		paths = append(paths, p)
+	}
+	sort.Strings(paths)
+	return paths
+}
+
+func formatChangePaths(cs *changeSet) string {
+	paths := changePaths(cs)
+	if len(paths) == 0 {
+		return ""
+	}
+	return "files: " + strings.Join(paths, ", ")
+}
+
+func sameFileState(a, b fileState) bool {
+	return a.Exists == b.Exists && bytes.Equal(a.Content, b.Content)
 }
 
 func (s *snapshotManager) apply(cs *changeSet, redo bool) error {

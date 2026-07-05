@@ -25,7 +25,7 @@ type terminalInteractor struct {
 	out io.Writer
 }
 
-func (a *terminalInteractor) AskApproval(_ context.Context, req gage.PermissionRequest) (gage.Approval, error) {
+func (a *terminalInteractor) AskApproval(_ context.Context, req gage.PermissionRequest) (approvalDecision, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	// Summary is filled by the agent from the tool's ToolCallDescriber; fall
@@ -34,19 +34,23 @@ func (a *terminalInteractor) AskApproval(_ context.Context, req gage.PermissionR
 	if summary == "" {
 		summary = req.Tool + " " + string(req.Input)
 	}
-	fmt.Fprintf(a.out, "\n\x1b[33m⚠ %s\x1b[0m\n  allow? [y]es / [a]lways for this exact call / [N]o: ", summary)
+	fmt.Fprintf(a.out, "\n\x1b[33m⚠ %s\x1b[0m\n  allow? [y]es / [a]lways this exact call / always this [t]ool / [p]ostpone (pause run) / [N]o: ", summary)
 
 	line, err := a.in.ReadString('\n')
 	if err != nil {
-		return gage.Denied("approval prompt unavailable"), nil
+		return approvalDecision{Approval: gage.Denied("approval prompt unavailable")}, nil
 	}
 	switch strings.ToLower(strings.TrimSpace(line)) {
 	case "y", "yes":
-		return gage.Allowed(), nil
+		return approvalDecision{Approval: gage.Allowed()}, nil
 	case "a", "always":
-		return gage.Approval{Allow: true, Remember: true}, nil
+		return approvalDecision{Approval: gage.Approval{Allow: true, Remember: true}}, nil
+	case "t", "tool":
+		return approvalDecision{Approval: gage.Allowed(), RememberTool: true}, nil
+	case "p", "postpone", "later":
+		return approvalDecision{Postpone: true}, nil
 	default:
-		return gage.Denied("the user denied this call; explain what you wanted to do or try another approach"), nil
+		return approvalDecision{Approval: gage.Denied("the user denied this call; explain what you wanted to do or try another approach")}, nil
 	}
 }
 

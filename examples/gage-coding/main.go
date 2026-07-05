@@ -29,13 +29,14 @@ func main() {
 	skillsDir := flag.String("skills", ".agents/skills", "directory of SKILL.md skill folders, resolved against -root")
 	configPath := flag.String("config", "", "path to .gage-coding.json/.jsonc config (default: search in -root)")
 	tui := flag.Bool("tui", true, "run the Bubble Tea TUI (set false for the plain REPL)")
+	readOnly := flag.Bool("readonly", false, "disable mutating tools and shell commands regardless of mode")
 	flag.Parse()
 
 	var err error
 	if *login != "" {
 		err = runLogin(*login)
 	} else {
-		err = run(*root, *model, *sessionID, *skillsDir, *configPath, *auto || *yolo, *tui)
+		err = run(*root, *model, *sessionID, *skillsDir, *configPath, *auto || *yolo, *tui, *readOnly)
 	}
 	if err != nil && !isTerminalAbort(err) {
 		fmt.Fprintln(os.Stderr, "gage-coding:", err)
@@ -58,7 +59,7 @@ func runLogin(provider string) error {
 	}
 }
 
-func run(root, model, sessionID, skillsDir, configPath string, auto, useTUI bool) error {
+func run(root, model, sessionID, skillsDir, configPath string, auto, useTUI, readOnly bool) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
@@ -66,6 +67,7 @@ func run(root, model, sessionID, skillsDir, configPath string, auto, useTUI bool
 	if err != nil {
 		return err
 	}
+	app.readOnly = readOnly
 	defer app.Close()
 
 	mode := mustMode(app.cfg.DefaultMode)
@@ -82,6 +84,9 @@ func runREPL(ctx context.Context, app *appRuntime, mode agentMode, auto bool) er
 	fmt.Printf("gage-coding · %s · root %s · mode %s (/help to list commands)\n", app.modelID, app.root, mode)
 	if auto {
 		fmt.Println("\x1b[33m⚠ approval prompts disabled (-auto/-yolo): every tool call runs unattended\x1b[0m")
+	}
+	if app.pending != nil {
+		fmt.Println("\x1b[36ma paused run from a previous session awaits decisions — /resume to continue\x1b[0m")
 	}
 	r := &renderer{out: os.Stdout}
 	for {
@@ -108,6 +113,18 @@ func runREPL(ctx context.Context, app *appRuntime, mode agentMode, auto bool) er
 			}
 			if res.Output != "" {
 				fmt.Println(res.Output)
+			}
+			if res.Resume {
+				_, summary, err := app.RunResume(ctx, mode, r.handle)
+				if err != nil {
+					if ctx.Err() != nil {
+						return nil
+					}
+					fmt.Fprintf(os.Stderr, "\nresume failed: %v\n", err)
+				} else if summary != "" {
+					fmt.Printf("\x1b[2m%s\x1b[0m\n", summary)
+				}
+				continue
 			}
 			if res.Prompt == "" {
 				continue

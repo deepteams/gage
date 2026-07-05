@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 
 	"github.com/deepteams/gage"
 )
@@ -34,8 +35,20 @@ type patternRule struct {
 	Action  permissionAction
 }
 
+// approvalDecision is what an interactive asker returns: the approval itself
+// plus UI-level scope flags that gage.Approval alone cannot express.
+type approvalDecision struct {
+	gage.Approval
+	// RememberTool caches the decision for every future call of the same tool
+	// this session, regardless of arguments (the 't' answer).
+	RememberTool bool
+	// Postpone defers the decision: the run pauses with ErrApprovalPending and
+	// a checkpoint is kept for /resume (the 'p' answer).
+	Postpone bool
+}
+
 type approvalAsker interface {
-	AskApproval(ctx context.Context, req gage.PermissionRequest) (gage.Approval, error)
+	AskApproval(ctx context.Context, req gage.PermissionRequest) (approvalDecision, error)
 }
 
 type configuredApprover struct {
@@ -112,6 +125,11 @@ func parsePermissionAction(raw string) (permissionAction, error) {
 }
 
 func (a *configuredApprover) Approve(ctx context.Context, req gage.PermissionRequest) (gage.Approval, error) {
+	dec, err := a.decide(ctx, req)
+	return dec.Approval, err
+}
+
+func (a *configuredApprover) decide(ctx context.Context, req gage.PermissionRequest) (approvalDecision, error) {
 	action := a.resolve(req)
 	// Never auto-approve a shell command that chains, redirects, or expands:
 	// an allow rule like "git status*" must not green-light a compound command
@@ -121,20 +139,63 @@ func (a *configuredApprover) Approve(ctx context.Context, req gage.PermissionReq
 	}
 	switch action {
 	case permissionAllow:
-		return gage.Allowed(), nil
+		return approvalDecision{Approval: gage.Allowed()}, nil
 	case permissionDeny:
-		return gage.Denied("denied by permission config"), nil
+		return approvalDecision{Approval: gage.Denied("denied by permission config")}, nil
 	default:
 		if a.auto {
-			return gage.Allowed(), nil
+			return approvalDecision{Approval: gage.Allowed()}, nil
 		}
 		if a.asker == nil {
 			// No interactive approver was wired: fail closed rather than
 			// silently allowing every sensitive call.
-			return gage.Denied("no interactive approver configured"), nil
+			return approvalDecision{Approval: gage.Denied("no interactive approver configured")}, nil
 		}
-		return a.asker.AskApproval(ctx, req)
+		dec, err := a.asker.AskApproval(ctx, req)
+		if err != nil {
+			return approvalDecision{}, err
+		}
+		if dec.Postpone {
+			return approvalDecision{}, gage.ErrApprovalPending
+		}
+		return dec, nil
 	}
+}
+
+// toolMemoryApprover caches "always allow this tool" decisions ('t') by tool
+// name for the session. Exact-input decisions ('a') pass through with
+// Approval.Remember set so the surrounding gage.RememberingPerInput wrapper
+// caches them; postponed decisions surface as gage.ErrApprovalPending and
+// pause the run into a checkpoint.
+type toolMemoryApprover struct {
+	inner  *configuredApprover
+	mu     sync.Mutex
+	byTool map[string]gage.Approval
+}
+
+func (t *toolMemoryApprover) Approve(ctx context.Context, req gage.PermissionRequest) (gage.Approval, error) {
+	t.mu.Lock()
+	cached, ok := t.byTool[req.Tool]
+	t.mu.Unlock()
+	if ok {
+		// A tool-wide decision applies beyond one concrete invocation: drop any
+		// per-call input rewrite.
+		cached.UpdatedInput = nil
+		return cached, nil
+	}
+	dec, err := t.inner.decide(ctx, req)
+	if err != nil {
+		return gage.Approval{}, err
+	}
+	if dec.RememberTool {
+		ap := dec.Approval
+		ap.Remember = false
+		t.mu.Lock()
+		t.byTool[req.Tool] = ap
+		t.mu.Unlock()
+		return ap, nil
+	}
+	return dec.Approval, nil
 }
 
 func (a *configuredApprover) resolve(req gage.PermissionRequest) permissionAction {
