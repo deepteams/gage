@@ -1,0 +1,323 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/deepteams/gage"
+)
+
+type fileState struct {
+	Exists  bool
+	Content []byte
+}
+
+type fileChange struct {
+	Path   string
+	Before fileState
+	After  fileState
+}
+
+type changeSet struct {
+	Prompt  string
+	Changes map[string]*fileChange
+}
+
+type snapshotManager struct {
+	root    string
+	mu      sync.Mutex
+	current *changeSet
+	undo    []*changeSet
+	redo    []*changeSet
+}
+
+func newSnapshotManager(root string) *snapshotManager {
+	return &snapshotManager{root: root}
+}
+
+func (s *snapshotManager) Begin(prompt string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.current = &changeSet{Prompt: prompt, Changes: map[string]*fileChange{}}
+}
+
+func (s *snapshotManager) Discard() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.current = nil
+}
+
+func (s *snapshotManager) Commit() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.current == nil || len(s.current.Changes) == 0 {
+		s.current = nil
+		return 0
+	}
+	s.undo = append(s.undo, s.current)
+	s.redo = nil
+	n := len(s.current.Changes)
+	s.current = nil
+	return n
+}
+
+func (s *snapshotManager) RecordBefore(path string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.current == nil {
+		return nil
+	}
+	abs, rel, err := s.resolve(path)
+	if err != nil {
+		return err
+	}
+	if _, ok := s.current.Changes[rel]; ok {
+		return nil
+	}
+	before, err := readFileState(abs)
+	if err != nil {
+		return err
+	}
+	s.current.Changes[rel] = &fileChange{Path: rel, Before: before}
+	return nil
+}
+
+func (s *snapshotManager) RecordAfter(path string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.current == nil {
+		return nil
+	}
+	abs, rel, err := s.resolve(path)
+	if err != nil {
+		return err
+	}
+	change, ok := s.current.Changes[rel]
+	if !ok {
+		before, err := readFileState(abs)
+		if err != nil {
+			return err
+		}
+		change = &fileChange{Path: rel, Before: before}
+		s.current.Changes[rel] = change
+	}
+	after, err := readFileState(abs)
+	if err != nil {
+		return err
+	}
+	change.After = after
+	return nil
+}
+
+func (s *snapshotManager) Undo() (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.undo) == 0 {
+		return "nothing to undo", nil
+	}
+	cs := s.undo[len(s.undo)-1]
+	s.undo = s.undo[:len(s.undo)-1]
+	if err := s.apply(cs, false); err != nil {
+		return "", err
+	}
+	s.redo = append(s.redo, cs)
+	return fmt.Sprintf("undid %d file change(s) from: %s", len(cs.Changes), cs.Prompt), nil
+}
+
+func (s *snapshotManager) Redo() (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.redo) == 0 {
+		return "nothing to redo", nil
+	}
+	cs := s.redo[len(s.redo)-1]
+	s.redo = s.redo[:len(s.redo)-1]
+	if err := s.apply(cs, true); err != nil {
+		return "", err
+	}
+	s.undo = append(s.undo, cs)
+	return fmt.Sprintf("redid %d file change(s) from: %s", len(cs.Changes), cs.Prompt), nil
+}
+
+func (s *snapshotManager) apply(cs *changeSet, redo bool) error {
+	for _, change := range cs.Changes {
+		state := change.Before
+		if redo {
+			state = change.After
+		}
+		abs, _, err := s.resolve(change.Path)
+		if err != nil {
+			return err
+		}
+		if !state.Exists {
+			if err := os.Remove(abs); err != nil && !os.IsNotExist(err) {
+				return err
+			}
+			continue
+		}
+		if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
+			return err
+		}
+		if err := os.WriteFile(abs, state.Content, 0o644); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *snapshotManager) resolve(path string) (abs string, rel string, err error) {
+	if path == "" {
+		return "", "", fmt.Errorf("empty path")
+	}
+	if filepath.IsAbs(path) {
+		abs = filepath.Clean(path)
+	} else {
+		abs = filepath.Join(s.root, path)
+	}
+	rel, err = filepath.Rel(s.root, abs)
+	if err != nil {
+		return "", "", err
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return "", "", fmt.Errorf("path %q escapes root", path)
+	}
+	return abs, rel, nil
+}
+
+func readFileState(path string) (fileState, error) {
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return fileState{}, nil
+	}
+	if err != nil {
+		return fileState{}, err
+	}
+	return fileState{Exists: true, Content: data}, nil
+}
+
+type formatterManager struct {
+	root  string
+	rules map[string][]string
+}
+
+func newFormatterManager(root string, cfg map[string][]string) *formatterManager {
+	rules := map[string][]string{}
+	if len(cfg) == 0 {
+		rules[".go"] = []string{"gofmt", "-w", "$FILE"}
+	} else {
+		for ext, cmd := range cfg {
+			if ext != "" && len(cmd) > 0 {
+				if !strings.HasPrefix(ext, ".") {
+					ext = "." + ext
+				}
+				rules[ext] = append([]string(nil), cmd...)
+			}
+		}
+	}
+	return &formatterManager{root: root, rules: rules}
+}
+
+func (f *formatterManager) Format(ctx context.Context, path string) (string, error) {
+	if f == nil {
+		return "", nil
+	}
+	ext := filepath.Ext(path)
+	cmdline, ok := f.rules[ext]
+	if !ok || len(cmdline) == 0 {
+		return "", nil
+	}
+	abs := path
+	if !filepath.IsAbs(abs) {
+		abs = filepath.Join(f.root, path)
+	}
+	args := make([]string, 0, len(cmdline)-1)
+	usedFile := false
+	for _, arg := range cmdline[1:] {
+		if strings.Contains(arg, "$FILE") || strings.Contains(arg, "{file}") {
+			usedFile = true
+			arg = strings.ReplaceAll(arg, "$FILE", abs)
+			arg = strings.ReplaceAll(arg, "{file}", abs)
+		}
+		args = append(args, arg)
+	}
+	if !usedFile {
+		args = append(args, abs)
+	}
+	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(cctx, cmdline[0], args...)
+	cmd.Dir = f.root
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("formatter %s failed: %s%v", cmdline[0], string(out), err)
+	}
+	return strings.Join(append([]string{cmdline[0]}, args...), " "), nil
+}
+
+type mutationTool struct {
+	inner     gage.Tool
+	snapshots *snapshotManager
+	format    *formatterManager
+}
+
+func wrapMutations(ts []gage.Tool, snapshots *snapshotManager, format *formatterManager) []gage.Tool {
+	out := make([]gage.Tool, 0, len(ts))
+	for _, t := range ts {
+		switch t.Name() {
+		case "write_file", "edit":
+			out = append(out, &mutationTool{inner: t, snapshots: snapshots, format: format})
+		default:
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+func (t *mutationTool) Name() string            { return t.inner.Name() }
+func (t *mutationTool) Description() string     { return t.inner.Description() }
+func (t *mutationTool) Schema() gage.JSONSchema { return t.inner.Schema() }
+func (t *mutationTool) Metadata() gage.ToolMetadata {
+	return gage.MetadataOf(t.inner)
+}
+func (t *mutationTool) DescribeCall(input json.RawMessage) string {
+	return gage.CallSummaryOf(t.inner, input)
+}
+
+func (t *mutationTool) Execute(ctx context.Context, input json.RawMessage) (gage.ToolResult, error) {
+	path := inputPath(input)
+	if path != "" && t.snapshots != nil {
+		if err := t.snapshots.RecordBefore(path); err != nil {
+			return gage.ErrorResult("", err.Error()), nil
+		}
+	}
+	res, err := t.inner.Execute(ctx, input)
+	if err != nil || res.IsError || path == "" {
+		return res, err
+	}
+	if formatted, ferr := t.format.Format(ctx, path); ferr != nil {
+		res.Content = append(res.Content, gage.TextPart("\nformatter error: "+ferr.Error()))
+	} else if formatted != "" {
+		res.Content = append(res.Content, gage.TextPart("\nformatted with "+formatted))
+	}
+	if t.snapshots != nil {
+		if err := t.snapshots.RecordAfter(path); err != nil {
+			res.Content = append(res.Content, gage.TextPart("\nsnapshot error: "+err.Error()))
+		}
+	}
+	return res, nil
+}
+
+func inputPath(input json.RawMessage) string {
+	var args struct {
+		Path string `json:"path"`
+	}
+	_ = json.Unmarshal(input, &args)
+	return args.Path
+}

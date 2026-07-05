@@ -1,0 +1,46 @@
+{
+  "$schema": "./schema-not-enforced-demo.json",
+  // This mirrors a small subset of opencode's config surface.
+  "default_mode": "build",
+  "permission": {
+    "*": "ask",
+    "read": {
+      "*": "allow",
+      "*.env": "deny",
+      "*.env.*": "deny",
+      "*.env.example": "allow"
+    },
+    "list": "allow",
+    "glob": "allow",
+    "grep": "allow",
+    "skill": "allow",
+    "todo": "allow",
+    "question": "allow",
+    "edit": "ask",
+    "webfetch": "ask",
+    "websearch": "ask",
+    "task": "ask",
+    "mcp": "ask",
+    "bash": {
+      "*": "ask",
+      "git status*": "allow",
+      "git diff*": "allow",
+      "go test*": "ask",
+      "rm *": "deny",
+      "sudo *": "deny"
+    }
+  },
+  "formatters": {
+    ".go": ["gofmt", "-w", "$FILE"]
+  },
+  "tools": {
+    "web_search": true
+  },
+  "mcp": {
+    "everything": {
+      "type": "local",
+      "command": ["npx", "-y", "@modelcontextprotocol/server-everything"],
+      "enabled": false
+    }
+  }
+}

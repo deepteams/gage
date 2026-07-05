@@ -1,119 +1,137 @@
 # gage-coding
 
-A minimal interactive coding agent — the skeleton of an "opencode-like" CLI —
-built entirely on gage. It is an example, not a product: ~400 lines showing how
-the library's pieces are meant to fit together.
+An opencode-like coding agent demo built on `gage`.
 
-This directory is its own Go module (with a `replace` on the parent), like
-`otel/`, so the gage library itself keeps zero `main` packages.
+It is still an example, not a product, but it now demonstrates most of the
+moving pieces you expect from a modern terminal coding agent:
+
+- Bubble Tea TUI with streaming tool calls, approvals, modes, and slash commands
+- Build / Plan / Review agent modes
+- guarded coding tools: read/write/edit/list, grep/glob, bash, web fetch/search
+- `AGENTS.md` / `CLAUDE.md` style project instructions
+- Claude Code-style `SKILL.md` skills
+- `.agents/commands/*.md` custom commands with `$ARGUMENTS`
+- `todowrite`, `todoread`, and `question` tools
+- permission config with `allow`, `ask`, `deny`, wildcards, and auto mode
+- format-on-edit, currently defaulting Go files through `gofmt`
+- undo/redo snapshots for changes made through `write_file` and `edit`
+- optional local/remote MCP tools from config
+- session persistence, context compaction, retries, tool timeouts, and cost summary
+- Codex and Claude Code OAuth login flows, plus API-key and Ollama providers
 
 ## Run
 
 ```sh
 cd examples/gage-coding
 
-# Pick a backend — either an OAuth subscription login (once):
-go run . -login codex                  # ChatGPT/Codex plan, no API key
+# OAuth subscription providers:
+go run . -login codex
+go run . -login claude
 
-# ...or an API key:
-export ANTHROPIC_API_KEY=sk-ant-...    # Anthropic Messages API
-export OPENROUTER_API_KEY=sk-or-...    # any model on OpenRouter
-#   ...or neither: falls back to a local ollama daemon (OLLAMA_HOST to override)
+# Or API keys:
+export ANTHROPIC_API_KEY=sk-ant-...
+export OPENROUTER_API_KEY=sk-or-...
 
-go run . [-root DIR] [-model ID] [-session NAME] [-yolo]
+# Or neither: falls back to local Ollama.
+go run . -session demo
 ```
 
-Provider precedence: stored codex tokens → `ANTHROPIC_API_KEY` →
-`OPENROUTER_API_KEY` → local ollama.
+By default the Bubble Tea TUI starts. Use `-tui=false` for the plain REPL.
 
-- `-root` — workspace the agent may read and modify (default `.`). All
-  filesystem tools are confined to it, symlink-safe.
-- `-model` — model id; defaults per provider (`claude-sonnet-4-5`,
-  `anthropic/claude-sonnet-4.5`, `qwen3:8b`).
-- `-session` — persist the conversation under `<root>/.gage-coding/` and
-  resume it on the next run.
-- `-yolo` — skip approval prompts. Only for tasks you fully trust.
-- `-login codex` — run the OAuth (PKCE) login flow for a ChatGPT plan and
-  exit. Tokens are stored under your user config dir
-  (`~/Library/Application Support/gage-coding/codex.json` on macOS,
-  `~/.config/gage-coding/codex.json` on Linux) and refreshed transparently.
-- `-skills` — directory of SKILL.md skill folders, resolved against `-root`
-  (default `.agents/skills`, the cross-tool convention for per-project
-  skills — so pointing `-root` at any project picks up that project's own
-  skills). A missing directory simply means no skills.
+Provider precedence is: stored Codex tokens, stored Claude Code tokens,
+`ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`, local Ollama.
 
-## Skills and the explore sub-agent
+Useful flags:
 
-Two demo skills ship in `.agents/skills/`: `conventional-commits` (how to stage and
-write a commit) and `go-table-tests` (house style for Go tests). Their
-name+description are advertised in the system prompt; the model loads a
-skill's full instructions only when relevant, via the `skill` tool:
+- `-root DIR` confines filesystem tools to a workspace root.
+- `-model ID` overrides the provider default or config model.
+- `-session NAME` persists conversation state under `<root>/.gage-coding/`.
+- `-auto` approves permission requests unless config denies them.
+- `-config PATH` uses a specific `.gage-coding.json/.jsonc`.
+- `-skills DIR` points at `SKILL.md` skill folders.
 
-```
-> écris un test pour la fonction truncate
-⏺ skill {"name":"go-table-tests"}
-⏺ read_file {"path":"render.go"}
-...
-```
+## TUI Commands
 
-The `explore` tool is a **sub-agent**: a second, read-only agent (read_file,
-list_dir, grep, glob only — filtered by each tool's own `ToolMetadata`)
-exposed to the main agent with `agent.AsTool`. The main agent delegates
-"where is X? / how does Y work?" questions to it and receives only the final
-summary, keeping large intermediate file dumps out of its own context. Each
-delegation is gated by the main agent's Approver; the sub-agent itself needs
-none since it cannot write, shell out, or reach the network.
+Inside the TUI:
 
-Then just talk to it:
-
-```
-> add a --verbose flag to cmd/serve and thread it into the logger
+```text
+/mode plan      switch to read-only planning
+/mode build     switch back to coding
+/mode review    code-review posture, no edits
+/init           create AGENTS.md starter rules
+/tools          list tools visible in the current mode
+/skills         list loaded skills
+/commands       list custom commands
+/undo           revert tracked write_file/edit changes
+/redo           reapply the last undo
+/reload         reload config, rules, skills, and commands
+/clear          clear conversation history
+/quit           exit
 ```
 
-Tool calls stream as they happen; writes, shell commands and network access
-prompt for approval (`y` once, `a` always for that exact call, `n` deny).
+Custom commands live in `.agents/commands/*.md`. This example ships:
 
-## What each file demonstrates
+- `/plan some feature`
+- `/review some path or behavior`
+- `/test some scope`
+- `/commit`
 
-| File | gage concepts |
+## Config
+
+The included `.gage-coding.jsonc` demonstrates the opencode-style surface:
+
+- `permission` controls tool categories with `allow`, `ask`, `deny`.
+- `tools` can hide tools entirely.
+- `formatters` maps file extensions to commands, using `$FILE`.
+- `mcp` can define local or remote MCP servers. The sample MCP is disabled.
+- `instructions` can add extra local instruction files or globs.
+
+Example permission snippet:
+
+```jsonc
+{
+  "permission": {
+    "read": {
+      "*": "allow",
+      "*.env": "deny",
+      "*.env.*": "deny",
+      "*.env.example": "allow"
+    },
+    "bash": {
+      "*": "ask",
+      "git status*": "allow",
+      "rm *": "deny"
+    },
+    "edit": "ask"
+  }
+}
+```
+
+## File Map
+
+| File | Demonstrates |
 |---|---|
-| `main.go` | `agent.New` + `agent.Config` guardrails (`MaxTurns`, `MaxToolRepeats`, `MaxStreamRetries`, `ToolTimeout`, `MaxParallelTools`), compaction (`agent.Summarize` + `CompactAfter` + `CountTokens`), provider selection behind the `gage.Provider` port, tool registry assembly (`tools.NewFSTools`/`NewSearchTools`/`NewBashTool`/`NewWebTools`, `LimitResultSizeAll`), session persistence (`sessions.NewFileStore`, `gage.Session`), cost estimation (`pricing.Cost`) |
-| `approver.go` | a custom `gage.Approver`: auto-allow read-only local tools via `ToolMetadata`, prompt for the rest, remembered decisions with `gage.RememberingPerInput` |
-| `codex.go` | the OAuth way of connecting: `codex.Login` (PKCE, localhost callback), a file-backed `gage.TokenStore` (`oauth.NewFileStore`), and `codex.New` with transparent token refresh |
-| `skills.go` + `.agents/skills/` | loading SKILL.md folders with `skills.LoadDir`, advertising them via `agent.Config.Skills`, on-demand loading through `skills.NewTool` |
-| `subagent.go` | sub-agent delegation with `agent.AsTool`: a read-only explorer agent exposed as an `explore` tool, tool subset selected by `ToolMetadata` |
-| `render.go` | consuming the `gage.Event` stream: text/reasoning deltas, tool calls and results, resetting partial output on `message_start` after a mid-stream retry |
+| `main.go` | flags, TUI/REPL entrypoints, provider selection |
+| `tui.go` | Bubble Tea UI, streaming events, approvals, question prompts |
+| `runtime.go` | mode-specific agent construction, sessions, MCP, slash commands |
+| `permissions.go` | opencode-like permission rules and wildcards |
+| `modes.go` | Build / Plan / Review system behavior |
+| `commands.go` + `.agents/commands/` | markdown custom commands |
+| `instructions.go` | `AGENTS.md`, `CLAUDE.md`, and rules loading |
+| `mutations.go` | format-on-edit and undo/redo snapshots |
+| `extra_tools.go` | `todowrite`, `todoread`, `question` tools |
+| `skills.go` + `.agents/skills/` | `SKILL.md` loading and `skill` tool |
+| `subagent.go` | read-only `explore` sub-agent exposed as a tool |
+| `codex.go`, `claude.go` | OAuth subscription providers |
+| `render.go` | plain REPL event renderer |
 
-## Security posture (deliberate defaults)
+## Deliberate Limits
 
-- Filesystem tools are confined to `-root`; paths cannot escape it, even via
-  symlinks.
-- `bash` runs with a minimal sanitized environment (`BashConfig.Env` nil), so
-  API keys in the CLI's environment never leak into model-driven commands.
-  This is **not** an OS sandbox — for untrusted input, set
-  `BashConfig.RequireSandbox` with a real `BashSandbox`.
-- `web_fetch` keeps private-host blocking on: the model cannot reach
-  localhost or link-local addresses.
-- Every tool result is capped (`LimitResultSizeAll`) so one huge output cannot
-  blow up the context window.
-- "Always" approvals are cached per tool **and exact input**
-  (`RememberingPerInput`), never per tool name alone.
-
-## Going further
-
-Things a real opencode-style CLI would add, and where gage already helps:
-
-- **More OAuth subscription providers** — `codex.go` shows the pattern for a
-  ChatGPT plan; `providers/claudecode` works the same way for Claude
-  subscriptions (`claudecode.Login` + a `gage.TokenStore`). Note these
-  providers call undocumented backend endpoints that may change; see the
-  package docs. For headless environments, `oauth.ManualLogin` replaces the
-  localhost callback with a paste-the-code flow.
-- **Out-of-band approvals** — return `gage.ErrApprovalPending` from the
-  Approver, persist the `gage.Checkpoint` from the `paused` event, resume with
-  `agent.Resume` (see the `workflow` package for a durable wrapper).
-- **MCP servers** — `mcp.New` adapts any MCP server's tools into the registry.
-- **Observability** — plug `otelgage` (nested module `otel/`) into
-  `agent.Config.Observer` for OpenTelemetry spans.
-- **Testing your agent** — script a fake provider with `gagetest` and assert
-  on the event stream; no network needed.
+- The Bubble Tea UI is a demo TUI, not a full opencode clone.
+- Undo/redo tracks `write_file` and `edit`; shell commands may change files
+  outside that snapshot mechanism.
+- `bash` is guarded and uses a sanitized environment, but it is not an OS
+  sandbox. For untrusted work, configure `BashConfig.RequireSandbox` with a
+  real sandbox implementation.
+- MCP OAuth management, LSP tools, share links, and server/web clients are left
+  as follow-up examples.

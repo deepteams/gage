@@ -10,22 +10,15 @@ import (
 	"github.com/deepteams/gage"
 )
 
-// terminalApprover gates tool execution from the terminal. Read-only local
-// tools (read_file, list_dir, grep, glob) run without asking; anything that
-// writes, shells out, or touches the network prompts. Answering "a" sets
-// Approval.Remember, which the gage.RememberingPerInput wrapper in main caches
-// by tool + exact input — approving one command never green-lights another.
-type terminalApprover struct {
+// terminalInteractor is the non-TUI fallback for approvals and question tool
+// prompts. Answering "a" sets Approval.Remember; gage.RememberingPerInput
+// caches that by tool + exact input.
+type terminalInteractor struct {
 	in  *bufio.Reader
 	out io.Writer
 }
 
-func (a *terminalApprover) Approve(_ context.Context, req gage.PermissionRequest) (gage.Approval, error) {
-	m := req.Metadata
-	if m.ReadOnly && !m.Destructive && !m.Network {
-		return gage.Allowed(), nil
-	}
-
+func (a *terminalInteractor) AskApproval(_ context.Context, req gage.PermissionRequest) (gage.Approval, error) {
 	// Summary is filled by the agent from the tool's ToolCallDescriber; fall
 	// back to the raw input for tools that do not describe their calls.
 	summary := req.Summary
@@ -46,4 +39,13 @@ func (a *terminalApprover) Approve(_ context.Context, req gage.PermissionRequest
 	default:
 		return gage.Denied("the user denied this call; explain what you wanted to do or try another approach"), nil
 	}
+}
+
+func (a *terminalInteractor) AskQuestion(_ context.Context, question string) (string, error) {
+	fmt.Fprintf(a.out, "\n\x1b[36m? %s\x1b[0m\n  answer: ", question)
+	line, err := a.in.ReadString('\n')
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(line), nil
 }
