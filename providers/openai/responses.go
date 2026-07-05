@@ -92,9 +92,13 @@ func (c *ResponsesClient) buildBody(req gage.Request) ([]byte, error) {
 	if model == "" {
 		return nil, fmt.Errorf("%s: no model specified", c.ProviderName)
 	}
+	input, err := toResponsesInput(req.Messages)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", c.ProviderName, err)
+	}
 	body := map[string]any{
 		"model":  model,
-		"input":  toResponsesInput(req.Messages),
+		"input":  input,
 		"stream": true,
 		"store":  c.Store,
 	}

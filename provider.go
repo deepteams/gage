@@ -43,3 +43,11 @@ type Provider interface {
 type ModelLister interface {
 	Models(ctx context.Context) ([]ModelInfo, error)
 }
+
+// TokenCounter is an optional capability: a provider that can count the exact
+// input tokens of a request through its API (Anthropic count_tokens, Gemini
+// countTokens). It costs an extra HTTP round-trip; EstimateTokens remains the
+// free heuristic when precision is not required.
+type TokenCounter interface {
+	CountTokens(ctx context.Context, req Request) (int, error)
+}

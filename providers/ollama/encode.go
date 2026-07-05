@@ -17,6 +17,15 @@ func buildNativeBody(req gage.Request, defaultModel string) ([]byte, error) {
 	if model == "" {
 		return nil, fmt.Errorf("ollama: no model specified")
 	}
+	// Ollama's native API has no document input; fail fast rather than
+	// silently dropping the part.
+	for _, m := range req.Messages {
+		for _, p := range m.Content {
+			if p.Kind == gage.PartDocument {
+				return nil, gage.Unsupported("ollama", "document parts")
+			}
+		}
+	}
 	body := map[string]any{
 		"model":    model,
 		"messages": toNativeMessages(req.System, req.Messages),

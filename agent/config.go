@@ -38,6 +38,15 @@ type Config struct {
 	Compactor gage.Compactor
 	// CompactAfter is the input-token threshold that triggers Compactor.
 	CompactAfter int
+	// CountTokens, when true and Provider implements gage.TokenCounter, makes
+	// the agent ask the provider for the exact input-token count of the
+	// upcoming request before each turn and use it for the proactive
+	// CompactAfter check, instead of the gage.EstimateTokens heuristic. It
+	// costs one extra HTTP round-trip per turn. When the provider lacks the
+	// capability or the count call fails, the agent falls back silently to
+	// the heuristic. Reactive compaction (driven by provider-reported usage
+	// after a turn) is unchanged.
+	CountTokens bool
 	// Options are the default generation options per turn.
 	Options gage.GenerateOptions
 	// MaxTurns caps loop iterations (default 16). A turn is one provider call

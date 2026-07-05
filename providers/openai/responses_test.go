@@ -161,13 +161,16 @@ func TestResponsesReasoningEncryptedContent(t *testing.T) {
 }
 
 func TestResponsesReasoningReplay(t *testing.T) {
-	input := toResponsesInput([]gage.Message{
+	input, err := toResponsesInput([]gage.Message{
 		gage.UserText("q"),
 		{Role: gage.RoleAssistant, Content: []gage.ContentPart{
 			gage.SignedReasoningPart("thought", "enc-abc"),
 			gage.ToolUsePart(gage.ToolCall{ID: "call_1", Name: "grep", Input: gage.JSONSchema(`{"p":1}`)}),
 		}},
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(input) != 3 {
 		t.Fatalf("input = %v", input)
 	}
@@ -179,22 +182,28 @@ func TestResponsesReasoningReplay(t *testing.T) {
 		t.Fatalf("function_call item = %v", input[2])
 	}
 	// Unsigned reasoning parts are skipped.
-	input = toResponsesInput([]gage.Message{
+	input, err = toResponsesInput([]gage.Message{
 		{Role: gage.RoleAssistant, Content: []gage.ContentPart{gage.ReasoningPart("no token")}},
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(input) != 0 {
 		t.Fatalf("unsigned reasoning must be skipped: %v", input)
 	}
 }
 
 func TestResponsesInputPreservesImages(t *testing.T) {
-	input := toResponsesInput([]gage.Message{
+	input, err := toResponsesInput([]gage.Message{
 		{Role: gage.RoleUser, Content: []gage.ContentPart{
 			gage.TextPart("look"),
 			{Kind: gage.PartImage, Image: &gage.ImageSource{URL: "https://example.com/a.png"}},
 			{Kind: gage.PartImage, Image: &gage.ImageSource{MediaType: "image/png", Data: "abc123"}},
 		}},
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(input) != 1 {
 		t.Fatalf("input = %v", input)
 	}
@@ -295,5 +304,46 @@ func TestResponsesAuthorizerInvoked(t *testing.T) {
 	}
 	if gotAuth != "Bearer tok123" {
 		t.Fatalf("auth header = %q", gotAuth)
+	}
+}
+
+func TestResponsesDocumentParts(t *testing.T) {
+	input, err := toResponsesInput([]gage.Message{
+		{Role: gage.RoleUser, Content: []gage.ContentPart{
+			gage.TextPart("read"),
+			gage.DocumentPart(gage.DocumentSource{Data: "cGRm", MediaType: "application/pdf", Filename: "spec.pdf"}),
+			gage.DocumentPart(gage.DocumentSource{URL: "https://example.com/a.pdf"}),
+			gage.DocumentPart(gage.DocumentSource{Data: "dHh0"}),
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	content, ok := input[0]["content"].([]map[string]any)
+	if !ok || len(content) != 4 {
+		t.Fatalf("content = %#v", input[0]["content"])
+	}
+	// Inline document: input_file with filename + data: URL.
+	if content[1]["type"] != "input_file" || content[1]["filename"] != "spec.pdf" ||
+		content[1]["file_data"] != "data:application/pdf;base64,cGRm" {
+		t.Fatalf("inline document = %v", content[1])
+	}
+	// URL document: input_file with file_url.
+	if content[2]["type"] != "input_file" || content[2]["file_url"] != "https://example.com/a.pdf" {
+		t.Fatalf("url document = %v", content[2])
+	}
+	if _, ok := content[2]["file_data"]; ok {
+		t.Fatalf("unexpected file_data on url document: %v", content[2])
+	}
+	// Filename and media type defaults on inline documents.
+	if content[3]["filename"] != "document.pdf" || content[3]["file_data"] != "data:application/pdf;base64,dHh0" {
+		t.Fatalf("defaulted document = %v", content[3])
+	}
+
+	// A document with neither URL nor Data fails fast.
+	if _, err := toResponsesInput([]gage.Message{
+		{Role: gage.RoleUser, Content: []gage.ContentPart{gage.DocumentPart(gage.DocumentSource{})}},
+	}); err == nil {
+		t.Fatal("expected an error for an empty document part")
 	}
 }

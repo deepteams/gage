@@ -298,3 +298,156 @@ func TestModelRequired(t *testing.T) {
 		t.Fatal("expected an error for a missing model")
 	}
 }
+
+func TestDocumentPartsEncoding(t *testing.T) {
+	events := []string{`{"type":"message_stop"}`}
+	var reqBody []byte
+	srv := sseServer(t, events, &reqBody, nil)
+	p := New(Config{APIKey: "k", BaseURL: srv.URL, Model: "m"})
+	ch, err := p.Stream(context.Background(), gage.Request{
+		Messages: []gage.Message{
+			{Role: gage.RoleUser, Content: []gage.ContentPart{
+				gage.TextPart("summarize"),
+				gage.DocumentPart(gage.DocumentSource{Data: "cGRmLWJ5dGVz", Filename: "report.pdf"}),
+				gage.DocumentPart(gage.DocumentSource{URL: "https://example.com/spec.pdf"}),
+				gage.DocumentPart(gage.DocumentSource{Data: "dHh0", MediaType: "text/plain"}),
+			}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range ch {
+	}
+
+	var body map[string]any
+	if err := json.Unmarshal(reqBody, &body); err != nil {
+		t.Fatal(err)
+	}
+	msgs := body["messages"].([]any)
+	content := msgs[0].(map[string]any)["content"].([]any)
+	if len(content) != 4 {
+		t.Fatalf("content = %v", content)
+	}
+
+	// Inline base64 document: media_type defaults to application/pdf and
+	// Filename maps to title.
+	d0 := content[1].(map[string]any)
+	if d0["type"] != "document" || d0["title"] != "report.pdf" {
+		t.Fatalf("base64 document block = %v", d0)
+	}
+	src0 := d0["source"].(map[string]any)
+	if src0["type"] != "base64" || src0["media_type"] != "application/pdf" || src0["data"] != "cGRmLWJ5dGVz" {
+		t.Fatalf("base64 document source = %v", src0)
+	}
+
+	// URL document: url source, no title.
+	d1 := content[2].(map[string]any)
+	if d1["type"] != "document" {
+		t.Fatalf("url document block = %v", d1)
+	}
+	if _, ok := d1["title"]; ok {
+		t.Fatalf("unexpected title on url document: %v", d1)
+	}
+	src1 := d1["source"].(map[string]any)
+	if src1["type"] != "url" || src1["url"] != "https://example.com/spec.pdf" {
+		t.Fatalf("url document source = %v", src1)
+	}
+
+	// Explicit media type is preserved.
+	src2 := content[3].(map[string]any)["source"].(map[string]any)
+	if src2["media_type"] != "text/plain" {
+		t.Fatalf("explicit media_type = %v", src2)
+	}
+}
+
+func TestDocumentPartEmptyFails(t *testing.T) {
+	// A document with neither URL nor Data must fail before dialing.
+	p := New(Config{APIKey: "k", BaseURL: "http://127.0.0.1:0", Model: "m"})
+	_, err := p.Stream(context.Background(), gage.Request{
+		Messages: []gage.Message{
+			{Role: gage.RoleUser, Content: []gage.ContentPart{
+				gage.DocumentPart(gage.DocumentSource{Filename: "empty.pdf"}),
+			}},
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "document") {
+		t.Fatalf("err = %v, want document encoding error", err)
+	}
+}
+
+func TestCountTokens(t *testing.T) {
+	var reqBody []byte
+	var gotPath, gotMethod string
+	var headers http.Header
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath, gotMethod = r.URL.Path, r.Method
+		headers = r.Header.Clone()
+		reqBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"input_tokens":123}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	p := New(Config{APIKey: "key-9", BaseURL: srv.URL, Model: "claude-x"})
+	tc, ok := p.(gage.TokenCounter)
+	if !ok {
+		t.Fatal("anthropic provider does not implement gage.TokenCounter")
+	}
+	n, err := tc.CountTokens(context.Background(), gage.Request{
+		System:   "be nice",
+		Messages: []gage.Message{gage.UserText("count me")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 123 {
+		t.Fatalf("count = %d, want 123", n)
+	}
+	if gotMethod != http.MethodPost || gotPath != "/v1/messages/count_tokens" {
+		t.Fatalf("request = %s %s", gotMethod, gotPath)
+	}
+	if headers.Get("x-api-key") != "key-9" || headers.Get("anthropic-version") != Version {
+		t.Fatalf("headers = %v", headers)
+	}
+
+	// Same body shape as Stream, minus stream and max_tokens.
+	var body map[string]any
+	if err := json.Unmarshal(reqBody, &body); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := body["stream"]; ok {
+		t.Fatalf("stream must be omitted: %v", body)
+	}
+	if _, ok := body["max_tokens"]; ok {
+		t.Fatalf("max_tokens must be omitted: %v", body)
+	}
+	if body["model"] != "claude-x" {
+		t.Fatalf("model = %v", body["model"])
+	}
+	sys := body["system"].([]any)
+	if len(sys) != 1 || sys[0].(map[string]any)["text"] != "be nice" {
+		t.Fatalf("system = %v", sys)
+	}
+	msgs := body["messages"].([]any)
+	if len(msgs) != 1 || msgs[0].(map[string]any)["content"] != "count me" {
+		t.Fatalf("messages = %v", msgs)
+	}
+}
+
+func TestCountTokensAPIError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		io.WriteString(w, `{"error":{"type":"invalid_request_error","message":"bad"}}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	p := New(Config{APIKey: "k", BaseURL: srv.URL, Model: "m"})
+	_, err := p.(gage.TokenCounter).CountTokens(context.Background(), gage.Request{
+		Messages: []gage.Message{gage.UserText("hi")},
+	})
+	var apiErr *gage.APIError
+	if !errors.As(err, &apiErr) || apiErr.Status != http.StatusBadRequest {
+		t.Fatalf("err = %v, want *gage.APIError with status 400", err)
+	}
+}

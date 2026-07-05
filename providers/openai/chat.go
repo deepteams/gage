@@ -89,7 +89,10 @@ func (c *ChatClient) buildBody(req gage.Request) ([]byte, error) {
 	if model == "" {
 		return nil, fmt.Errorf("%s: no model specified", c.ProviderName)
 	}
-	msgs := toChatMessages(req.System, req.Messages)
+	msgs, err := toChatMessages(req.System, req.Messages, c.ProviderName)
+	if err != nil {
+		return nil, err
+	}
 	body := map[string]any{
 		"model":    model,
 		"messages": msgs,

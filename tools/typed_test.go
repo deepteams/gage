@@ -54,6 +54,25 @@ func TestTypedSchemaGolden(t *testing.T) {
 	}
 }
 
+func TestSchemaOfMatchesTyped(t *testing.T) {
+	if got, want := canonicalJSON(t, string(SchemaOf[deployArgs]())), canonicalJSON(t, deploySchemaGolden); got != want {
+		t.Fatalf("schema mismatch:\n got: %s\nwant: %s", got, want)
+	}
+	// Pointer type parameters dereference to the struct, like Typed.
+	if got, want := canonicalJSON(t, string(SchemaOf[*deployArgs]())), canonicalJSON(t, deploySchemaGolden); got != want {
+		t.Fatalf("pointer schema mismatch:\n got: %s\nwant: %s", got, want)
+	}
+}
+
+func TestSchemaOfPanicsOnNonStruct(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Fatal("expected panic for non-struct type parameter")
+		}
+	}()
+	SchemaOf[int]()
+}
+
 func canonicalJSON(t *testing.T, s string) string {
 	t.Helper()
 	var v any

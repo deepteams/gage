@@ -16,6 +16,7 @@ type PartKind string
 const (
 	PartText       PartKind = "text"
 	PartImage      PartKind = "image"
+	PartDocument   PartKind = "document"
 	PartToolUse    PartKind = "tool_use"
 	PartToolResult PartKind = "tool_result"
 	PartReasoning  PartKind = "reasoning"
@@ -31,13 +32,29 @@ type ImageSource struct {
 	Data string `json:"data,omitempty"`
 }
 
+// DocumentSource carries a document (e.g. a PDF), either as a URL or inline
+// base64 bytes. Providers that cannot accept documents fail the request with
+// ErrUnsupported rather than silently dropping the part.
+type DocumentSource struct {
+	// URL references a remote document. Mutually exclusive with Data.
+	URL string `json:"url,omitempty"`
+	// MediaType is the MIME type of Data (e.g. "application/pdf").
+	MediaType string `json:"media_type,omitempty"`
+	// Data is base64-encoded document bytes. Mutually exclusive with URL.
+	Data string `json:"data,omitempty"`
+	// Filename optionally names the document; some providers display it to the
+	// model or require it for format detection.
+	Filename string `json:"filename,omitempty"`
+}
+
 // ContentPart is a tagged union: Kind selects which field is meaningful.
 type ContentPart struct {
-	Kind       PartKind     `json:"kind"`
-	Text       string       `json:"text,omitempty"`        // PartText / PartReasoning
-	Image      *ImageSource `json:"image,omitempty"`       // PartImage
-	ToolCall   *ToolCall    `json:"tool_call,omitempty"`   // PartToolUse
-	ToolResult *ToolResult  `json:"tool_result,omitempty"` // PartToolResult
+	Kind       PartKind        `json:"kind"`
+	Text       string          `json:"text,omitempty"`        // PartText / PartReasoning
+	Image      *ImageSource    `json:"image,omitempty"`       // PartImage
+	Document   *DocumentSource `json:"document,omitempty"`    // PartDocument
+	ToolCall   *ToolCall       `json:"tool_call,omitempty"`   // PartToolUse
+	ToolResult *ToolResult     `json:"tool_result,omitempty"` // PartToolResult
 	// Signature is an opaque provider token attached to a PartReasoning that
 	// must be replayed verbatim with the reasoning text for the provider to
 	// accept the block in a later turn (Anthropic thinking signatures, OpenAI
@@ -85,6 +102,11 @@ func ReasoningPart(s string) ContentPart { return ContentPart{Kind: PartReasonin
 // replay signature.
 func SignedReasoningPart(s, signature string) ContentPart {
 	return ContentPart{Kind: PartReasoning, Text: s, Signature: signature}
+}
+
+// DocumentPart builds a document ContentPart.
+func DocumentPart(d DocumentSource) ContentPart {
+	return ContentPart{Kind: PartDocument, Document: &d}
 }
 
 // ToolUsePart builds a tool-use ContentPart.

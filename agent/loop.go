@@ -147,9 +147,25 @@ func (a *Agent) runLoop(ctx, sendCtx context.Context, input []gage.Message, resu
 		// Proactive compaction: shrink before the provider call when the
 		// estimated conversation size already crosses the threshold, so an
 		// oversized history never reaches the provider (the reported-usage
-		// trigger below can only fire after a first successful call).
+		// trigger below can only fire after a first successful call). With
+		// Config.CountTokens the heuristic estimate is upgraded to the
+		// provider's exact count when the capability is available, falling
+		// back silently to the heuristic on error.
 		if a.cfg.Compactor != nil && a.cfg.CompactAfter > 0 {
 			est := gage.EstimateTokens(conversation) + gage.EstimateTextTokens(a.cfg.systemPrompt())
+			if a.cfg.CountTokens {
+				if counter, ok := a.cfg.Provider.(gage.TokenCounter); ok {
+					if exact, err := counter.CountTokens(ctx, gage.Request{
+						Model:    a.cfg.Model,
+						Messages: conversation,
+						Tools:    schemas,
+						System:   a.cfg.systemPrompt(),
+						Options:  a.cfg.Options,
+					}); err == nil {
+						est = exact
+					}
+				}
+			}
 			if est >= a.cfg.CompactAfter {
 				if err := compact(gage.Usage{InputTokens: est}); err != nil {
 					fail(turn, err)

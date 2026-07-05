@@ -2,13 +2,14 @@ package openai
 
 import (
 	"encoding/json"
+	"fmt"
 
 	"github.com/deepteams/gage"
 )
 
 // ---- Request encoding (Responses API "input" items) ----
 
-func toResponsesInput(msgs []gage.Message) []map[string]any {
+func toResponsesInput(msgs []gage.Message) ([]map[string]any, error) {
 	var out []map[string]any
 	for _, m := range msgs {
 		switch m.Role {
@@ -57,17 +58,21 @@ func toResponsesInput(msgs []gage.Message) []map[string]any {
 				}
 			}
 		default:
+			content, err := contentToResponsesInput(m.Content)
+			if err != nil {
+				return nil, err
+			}
 			out = append(out, map[string]any{
 				"type":    "message",
 				"role":    string(m.Role),
-				"content": contentToResponsesInput(m.Content),
+				"content": content,
 			})
 		}
 	}
-	return out
+	return out, nil
 }
 
-func contentToResponsesInput(parts []gage.ContentPart) []map[string]any {
+func contentToResponsesInput(parts []gage.ContentPart) ([]map[string]any, error) {
 	content := make([]map[string]any, 0, len(parts))
 	for _, p := range parts {
 		switch p.Kind {
@@ -84,12 +89,39 @@ func contentToResponsesInput(parts []gage.ContentPart) []map[string]any {
 			if url != "" {
 				content = append(content, map[string]any{"type": "input_image", "image_url": url})
 			}
+		case gage.PartDocument:
+			if p.Document == nil {
+				continue
+			}
+			switch {
+			case p.Document.Data != "":
+				mediaType := p.Document.MediaType
+				if mediaType == "" {
+					mediaType = "application/pdf"
+				}
+				filename := p.Document.Filename
+				if filename == "" {
+					filename = "document.pdf"
+				}
+				content = append(content, map[string]any{
+					"type":      "input_file",
+					"filename":  filename,
+					"file_data": "data:" + mediaType + ";base64," + p.Document.Data,
+				})
+			case p.Document.URL != "":
+				content = append(content, map[string]any{
+					"type":     "input_file",
+					"file_url": p.Document.URL,
+				})
+			default:
+				return nil, fmt.Errorf("document part has neither url nor data")
+			}
 		}
 	}
 	if len(content) == 0 {
 		content = append(content, map[string]any{"type": "input_text", "text": ""})
 	}
-	return content
+	return content, nil
 }
 
 func toResponsesTools(tools []gage.ToolSchema) []map[string]any {

@@ -213,3 +213,19 @@ func TestNativeToolResultsCarryToolName(t *testing.T) {
 		t.Fatalf("tool results not correlated: %v / %v", msgs[2], msgs[3])
 	}
 }
+
+func TestNativeDocumentPartsUnsupported(t *testing.T) {
+	// The native Ollama API has no document input; the request must fail
+	// fast with ErrUnsupported, before dialing.
+	_, err := buildNativeBody(gage.Request{
+		Messages: []gage.Message{
+			{Role: gage.RoleUser, Content: []gage.ContentPart{
+				gage.TextPart("read"),
+				gage.DocumentPart(gage.DocumentSource{Data: "cGRm", MediaType: "application/pdf"}),
+			}},
+		},
+	}, "m")
+	if !errors.Is(err, gage.ErrUnsupported) {
+		t.Fatalf("err = %v, want ErrUnsupported", err)
+	}
+}

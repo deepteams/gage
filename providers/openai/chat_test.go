@@ -274,9 +274,12 @@ func TestChatResponseFormatMapping(t *testing.T) {
 func TestChatAssistantMessageNeverEmpty(t *testing.T) {
 	// An assistant history message with only reasoning parts must not encode
 	// as a bare {"role":"assistant"}; it falls back to empty string content.
-	msgs := toChatMessages("", []gage.Message{
+	msgs, err := toChatMessages("", []gage.Message{
 		{Role: gage.RoleAssistant, Content: []gage.ContentPart{gage.ReasoningPart("thinking...")}},
-	})
+	}, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(msgs) != 1 {
 		t.Fatalf("msgs = %v", msgs)
 	}
@@ -311,5 +314,66 @@ func TestChatStreamAPIError(t *testing.T) {
 	var apiErr *gage.APIError
 	if !errors.As(err, &apiErr) || apiErr.Status != 401 {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestChatDocumentInline(t *testing.T) {
+	// An inline document becomes a {"type":"file"} content part carrying a
+	// data: URL; Filename defaults to document.pdf when unset.
+	msgs, err := toChatMessages("", []gage.Message{
+		{Role: gage.RoleUser, Content: []gage.ContentPart{
+			gage.TextPart("read this"),
+			gage.DocumentPart(gage.DocumentSource{Data: "cGRm", MediaType: "application/pdf", Filename: "spec.pdf"}),
+			gage.DocumentPart(gage.DocumentSource{Data: "dHh0"}),
+		}},
+	}, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	content, ok := msgs[0]["content"].([]map[string]any)
+	if !ok || len(content) != 3 {
+		t.Fatalf("content = %#v", msgs[0]["content"])
+	}
+	f0, _ := content[1]["file"].(map[string]any)
+	if content[1]["type"] != "file" || f0 == nil {
+		t.Fatalf("file part = %v", content[1])
+	}
+	if f0["filename"] != "spec.pdf" || f0["file_data"] != "data:application/pdf;base64,cGRm" {
+		t.Fatalf("file = %v", f0)
+	}
+	// Filename and media type defaults.
+	f1 := content[2]["file"].(map[string]any)
+	if f1["filename"] != "document.pdf" || f1["file_data"] != "data:application/pdf;base64,dHh0" {
+		t.Fatalf("defaulted file = %v", f1)
+	}
+}
+
+func TestChatDocumentURLUnsupported(t *testing.T) {
+	// Chat Completions has no file-URL input; the request must fail fast,
+	// before dialing.
+	c := &ChatClient{ProviderName: "test", BaseURL: "http://127.0.0.1:0", DefaultModel: "m"}
+	_, err := c.Stream(context.Background(), gage.Request{
+		Messages: []gage.Message{
+			{Role: gage.RoleUser, Content: []gage.ContentPart{
+				gage.DocumentPart(gage.DocumentSource{URL: "https://example.com/a.pdf"}),
+			}},
+		},
+	})
+	if !errors.Is(err, gage.ErrUnsupported) {
+		t.Fatalf("err = %v, want ErrUnsupported", err)
+	}
+}
+
+func TestChatDocumentEmptyFails(t *testing.T) {
+	c := &ChatClient{ProviderName: "test", BaseURL: "http://127.0.0.1:0", DefaultModel: "m"}
+	_, err := c.Stream(context.Background(), gage.Request{
+		Messages: []gage.Message{
+			{Role: gage.RoleUser, Content: []gage.ContentPart{
+				gage.DocumentPart(gage.DocumentSource{}),
+			}},
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "document") {
+		t.Fatalf("err = %v, want document encoding error", err)
 	}
 }

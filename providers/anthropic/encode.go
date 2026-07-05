@@ -19,6 +19,17 @@ const RedactedSignaturePrefix = "redacted:"
 // buildBody maps a gage.Request onto a Messages API request body. structured
 // reports whether output_format was used (the caller adds the beta header).
 func (c *Client) buildBody(req gage.Request) (body []byte, structured bool, err error) {
+	b, structured, err := c.buildBodyMap(req)
+	if err != nil {
+		return nil, false, err
+	}
+	body, err = json.Marshal(b)
+	return body, structured, err
+}
+
+// buildBodyMap builds the request body as a map so callers can adjust it
+// before marshalling (CountTokens strips stream/max_tokens).
+func (c *Client) buildBodyMap(req gage.Request) (b map[string]any, structured bool, err error) {
 	model := req.Model
 	if model == "" {
 		model = c.DefaultModel
@@ -33,11 +44,15 @@ func (c *Client) buildBody(req gage.Request) (body []byte, structured bool, err 
 	if maxTokens <= 0 {
 		maxTokens = DefaultMaxTokens
 	}
-	b := map[string]any{
+	msgs, err := toMessages(req.Messages)
+	if err != nil {
+		return nil, false, fmt.Errorf("%s: %w", c.ProviderName, err)
+	}
+	b = map[string]any{
 		"model":      model,
 		"max_tokens": maxTokens,
 		"stream":     true,
-		"messages":   toMessages(req.Messages),
+		"messages":   msgs,
 	}
 	if sys := systemBlocks(c.SystemPrefix, req.System); len(sys) > 0 {
 		b["system"] = sys
@@ -65,8 +80,7 @@ func (c *Client) buildBody(req gage.Request) (body []byte, structured bool, err 
 	if req.Options.PromptCache {
 		applyPromptCache(b)
 	}
-	body, err = json.Marshal(b)
-	return body, structured, err
+	return b, structured, nil
 }
 
 // systemBlocks builds the system array: the prefix block first (claudecode's
@@ -82,7 +96,7 @@ func systemBlocks(prefix, system string) []map[string]any {
 	return blocks
 }
 
-func toMessages(msgs []gage.Message) []map[string]any {
+func toMessages(msgs []gage.Message) ([]map[string]any, error) {
 	out := make([]map[string]any, 0, len(msgs))
 	for _, m := range msgs {
 		switch m.Role {
@@ -102,10 +116,14 @@ func toMessages(msgs []gage.Message) []map[string]any {
 		case gage.RoleAssistant:
 			out = append(out, map[string]any{"role": "assistant", "content": assistantContent(m)})
 		default:
-			out = append(out, map[string]any{"role": "user", "content": userContent(m)})
+			content, err := userContent(m)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, map[string]any{"role": "user", "content": content})
 		}
 	}
-	return out
+	return out, nil
 }
 
 func assistantContent(m gage.Message) []map[string]any {
@@ -149,7 +167,7 @@ func assistantContent(m gage.Message) []map[string]any {
 	return content
 }
 
-func userContent(m gage.Message) any {
+func userContent(m gage.Message) (any, error) {
 	// Text-only content can be sent as a plain string.
 	hasNonText := false
 	for _, p := range m.Content {
@@ -158,7 +176,7 @@ func userContent(m gage.Message) any {
 		}
 	}
 	if !hasNonText {
-		return m.Text()
+		return m.Text(), nil
 	}
 	var content []map[string]any
 	for _, p := range m.Content {
@@ -184,9 +202,34 @@ func userContent(m gage.Message) any {
 					},
 				})
 			}
+		case gage.PartDocument:
+			if p.Document == nil {
+				continue
+			}
+			block := map[string]any{"type": "document"}
+			switch {
+			case p.Document.URL != "":
+				block["source"] = map[string]any{"type": "url", "url": p.Document.URL}
+			case p.Document.Data != "":
+				mediaType := p.Document.MediaType
+				if mediaType == "" {
+					mediaType = "application/pdf"
+				}
+				block["source"] = map[string]any{
+					"type":       "base64",
+					"media_type": mediaType,
+					"data":       p.Document.Data,
+				}
+			default:
+				return nil, fmt.Errorf("document part has neither url nor data")
+			}
+			if p.Document.Filename != "" {
+				block["title"] = p.Document.Filename
+			}
+			content = append(content, block)
 		}
 	}
-	return content
+	return content, nil
 }
 
 func toTools(tools []gage.ToolSchema) []map[string]any {

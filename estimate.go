@@ -12,6 +12,14 @@ const estimatedImageTokens = 1500
 // estimatedMessageOverhead accounts for per-message wire framing.
 const estimatedMessageOverhead = 4
 
+// estimatedDocumentBaseTokens is the flat heuristic cost of one document part;
+// inline data adds estimatedDocumentBytesPerToken on top (documents are billed
+// per rendered page, which correlates only loosely with byte size).
+const (
+	estimatedDocumentBaseTokens    = 1500
+	estimatedDocumentBytesPerToken = 50
+)
+
 // EstimateTextTokens roughly estimates the token count of a piece of text.
 func EstimateTextTokens(s string) int { return len(s) / 4 }
 
@@ -34,6 +42,11 @@ func estimateParts(parts []ContentPart) int {
 			n += EstimateTextTokens(p.Text)
 		case PartImage:
 			n += estimatedImageTokens
+		case PartDocument:
+			n += estimatedDocumentBaseTokens
+			if p.Document != nil {
+				n += len(p.Document.Data) / estimatedDocumentBytesPerToken
+			}
 		case PartToolUse:
 			if p.ToolCall != nil {
 				n += EstimateTextTokens(p.ToolCall.Name) + EstimateTextTokens(string(p.ToolCall.Input))

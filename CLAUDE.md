@@ -22,11 +22,14 @@ Everything streams end to end via `<-chan gage.Event`.
   outside the stdlib.
   - Domain: `message.go`, `tool_call.go`, `event.go`, `usage.go`, `options.go`,
     `result.go`, `model.go`, `errors.go`, `estimate.go` (heuristic token
-    estimation), `session.go` (`Checkpoint`, `Session`).
-  - Ports (interfaces): `provider.go` (`Provider`), `tool.go` (`Tool`,
+    estimation), `pricing.go` (`Pricing` rates + `Cost`), `session.go`
+    (`Checkpoint`, `Session`).
+  - Ports (interfaces): `provider.go` (`Provider`, plus the optional
+    `ModelLister` and `TokenCounter` capabilities), `tool.go` (`Tool`,
     `ToolRegistry`), `search.go` (`SearchProvider`), `permission.go`
     (`Approver`), `compact.go` (`Compactor`), `memory.go` (`MemoryStore`),
-    `auth.go` (`TokenStore`), `session.go` (`SessionStore`).
+    `embedding.go` (`Embedder`), `auth.go` (`TokenStore`), `session.go`
+    (`SessionStore`).
 - **Adapters** (sub-packages): depend on the core, never the reverse.
   - `providers/` — `Provider` implementations. `providers/shared` has the HTTP
     client (retry), SSE parser, `Send` helper, and OAuth (PKCE, `TokenSource`,
@@ -34,8 +37,11 @@ Everything streams end to end via `<-chan gage.Event`.
     and Responses (`responses.go`) wire formats; openrouter/vllm/ollama and
     codex build on them. `providers/anthropic` holds the reusable Messages wire
     format and the API-key provider; claudecode builds on it.
-    `providers/fallback` chains several providers: it fails over to the next
-    one when a provider errors before producing any content.
+    `providers/gemini` speaks the Gemini API natively (streaming, thinking
+    signatures, `countTokens`). `providers/fallback` chains several providers:
+    it fails over to the next one when a provider errors before producing any
+    content. Embedder adapters: `openai.Embeddings` (any OpenAI-compatible
+    `/embeddings` endpoint) and `ollama.Embedder`.
   - `tools/` — built-in tools, `Typed[T]` reflected tools, `MapRegistry`, the
     permission `Guard`, and the `LimitConcurrency`/`LimitResultSize` wrappers.
   - `search/` — `SearchProvider` impls (duckduckgo has no key).
@@ -44,12 +50,25 @@ Everything streams end to end via `<-chan gage.Event`.
     sampling backed by a `gage.Provider`.
   - `skills/` — `SKILL.md` loader + the `skill` tool.
   - `memory/` — in-memory `MemoryStore` + `memory_remember`,
-    `memory_recall`, and `memory_forget` tools.
+    `memory_recall`, and `memory_forget` tools; `NewWithEmbedder` upgrades
+    recall to cosine-similarity ranking (keyword fallback on embed failure).
   - `sessions/` — `SessionStore` impls (in-memory, JSON file store).
   - `agent/` — the loop (`loop.go`), config, hooks, compactors, sub-agents,
     pause/resume (`Resume`, `*Paused`).
   - `httpx/` — SSE handler.
   - `jsonschema/` — JSON Schema builder for tool params (public).
+  - `structured/` — typed structured output: `Generate[T]` (reflected strict
+    JSON schema, repair loop on invalid JSON, plain-prompt fallback on
+    `ErrUnsupported`), `Decode[T]`, `FromResult[T]`.
+  - `pricing/` — dated USD-per-MTok snapshot table (`Default`) with
+    exact/prefix/provider-stripped model lookup; override before billing.
+  - `gagetest/` — exported scripted `gage.Provider` so consumers test their
+    agents without network (canonical event sequences, error injection,
+    request capture).
+  - `otel/` — **nested Go module** (`github.com/deepteams/gage/otel`, package
+    `otelgage`): `agent.Observer` → OpenTelemetry spans (GenAI semconv). Kept
+    out of the root module so the core stays dependency-light; it uses a
+    `replace => ../` for in-repo dev and is consumable once the repo is tagged.
 
 **Rule:** never import an adapter package from the core. If the core needs a
 capability, express it as a port (interface) and let an adapter implement it.
@@ -83,8 +102,10 @@ returned `ErrApprovalPending`; the caller persists the checkpoint (see
 - Providers never silently drop an explicitly requested option: if a provider
   cannot honor `ResponseFormat`, `ToolChoice`, `StopSequences`, or
   `ReasoningEffort`, `Stream` fails fast with `gage.Unsupported(provider,
-  option)` (matching `ErrUnsupported`). `PromptCache` is the exception — it is
-  a hint, ignored where the provider has no explicit cache control.
+  option)` (matching `ErrUnsupported`). The same applies to content the
+  provider cannot express (e.g. `PartDocument` on ollama, document URLs on
+  Chat Completions). `PromptCache` is the exception — it is a hint, ignored
+  where the provider has no explicit cache control.
 - Stop reasons are typed (`gage.StopReason`); providers normalize their wire
   values onto the `Stop*` constants and pass unknown values through verbatim.
 - Tool-level failures are returned as a `ToolResult` with `IsError: true` (so
@@ -107,13 +128,17 @@ returned `ErrApprovalPending`; the caller persists the checkpoint (see
 - Compaction triggers both proactively (heuristic `gage.EstimateTokens` before
   the provider call, so an oversized first request never ships) and reactively
   (provider-reported input tokens); a `Compactor` returns the usage it spent.
+  `agent.Config.CountTokens` upgrades the proactive check to an exact
+  provider-side count when the provider implements `gage.TokenCounter`
+  (anthropic, gemini), falling back to the heuristic on error.
 - Built-in filesystem and web tools are security-sensitive. Keep root
   confinement symlink-safe, and keep `web_fetch` private-host blocking enabled
   by default unless the caller explicitly opts into trusted local/internal use.
 - Streaming goroutines own closing their output channel and always `select` on
   `ctx.Done()` when sending.
 - Keep dependencies minimal: stdlib + `modelcontextprotocol/go-sdk` (MCP) +
-  `gopkg.in/yaml.v3` (skill frontmatter) and their transitive deps.
+  `gopkg.in/yaml.v3` (skill frontmatter) and their transitive deps. Anything
+  heavier (OpenTelemetry) lives in its own nested module (see `otel/`).
 
 ## Adding things
 
@@ -135,6 +160,7 @@ returned `ErrApprovalPending`; the caller persists the checkpoint (see
 go build ./...
 go vet ./...
 go test ./... -race     # all tests; no real network (httptest / in-memory)
+(cd otel && go test ./... -race)   # nested module, not covered by ./...
 ```
 
 Tests never hit the network. Provider tests use `net/http/httptest`; MCP tests

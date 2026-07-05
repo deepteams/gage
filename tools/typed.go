@@ -66,6 +66,17 @@ func TypedWithMetadata[T any](name, description string, meta gage.ToolMetadata, 
 	}
 }
 
+// SchemaOf returns the JSON Schema reflected from the struct type T. It
+// reflects exactly the same subset as Typed (json tag names, desc/enum tags,
+// pointer/",omitempty" optionality, "additionalProperties": false) and, like
+// Typed, panics when T is not a struct (after dereferencing pointers) or uses
+// an unsupported field type: it is meant to run at program construction time.
+// Use it to derive structured-output schemas (gage.ResponseFormat) from the
+// same types you use for tool parameters.
+func SchemaOf[T any]() gage.JSONSchema {
+	return schemaOfStruct(reflect.TypeOf((*T)(nil)).Elem())
+}
+
 func unmarshalErrorMessage(tool string, err error) string {
 	var te *json.UnmarshalTypeError
 	if errors.As(err, &te) {

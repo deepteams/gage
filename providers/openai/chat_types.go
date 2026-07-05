@@ -2,13 +2,14 @@ package openai
 
 import (
 	"encoding/json"
+	"fmt"
 
 	"github.com/deepteams/gage"
 )
 
 // ---- Request encoding ----
 
-func toChatMessages(system string, msgs []gage.Message) []map[string]any {
+func toChatMessages(system string, msgs []gage.Message, provider string) ([]map[string]any, error) {
 	out := make([]map[string]any, 0, len(msgs)+1)
 	if system != "" {
 		out = append(out, map[string]any{"role": "system", "content": system})
@@ -59,29 +60,33 @@ func toChatMessages(system string, msgs []gage.Message) []map[string]any {
 			}
 			out = append(out, msg)
 		default:
-			out = append(out, map[string]any{"role": string(m.Role), "content": contentToChat(m.Content)})
+			content, err := contentToChat(m.Content, provider)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, map[string]any{"role": string(m.Role), "content": content})
 		}
 	}
-	return out
+	return out, nil
 }
 
 // contentToChat renders user/system content. Text-only content collapses to a
-// string; mixed content (with images) uses the array form.
-func contentToChat(parts []gage.ContentPart) any {
-	hasImage := false
+// string; mixed content (with images or documents) uses the array form.
+func contentToChat(parts []gage.ContentPart, provider string) (any, error) {
+	textOnly := true
 	for _, p := range parts {
-		if p.Kind == gage.PartImage {
-			hasImage = true
+		if p.Kind == gage.PartImage || p.Kind == gage.PartDocument {
+			textOnly = false
 		}
 	}
-	if !hasImage {
+	if textOnly {
 		var s string
 		for _, p := range parts {
 			if p.Kind == gage.PartText {
 				s += p.Text
 			}
 		}
-		return s
+		return s, nil
 	}
 	arr := make([]map[string]any, 0, len(parts))
 	for _, p := range parts {
@@ -97,9 +102,36 @@ func contentToChat(parts []gage.ContentPart) any {
 				url = "data:" + p.Image.MediaType + ";base64," + p.Image.Data
 			}
 			arr = append(arr, map[string]any{"type": "image_url", "image_url": map[string]any{"url": url}})
+		case gage.PartDocument:
+			if p.Document == nil {
+				continue
+			}
+			if p.Document.Data == "" {
+				if p.Document.URL != "" {
+					// Chat Completions has no file-URL input; fail fast rather
+					// than silently dropping the document.
+					return nil, gage.Unsupported(provider, "document URL parts")
+				}
+				return nil, fmt.Errorf("%s: document part has neither url nor data", provider)
+			}
+			mediaType := p.Document.MediaType
+			if mediaType == "" {
+				mediaType = "application/pdf"
+			}
+			filename := p.Document.Filename
+			if filename == "" {
+				filename = "document.pdf"
+			}
+			arr = append(arr, map[string]any{
+				"type": "file",
+				"file": map[string]any{
+					"filename":  filename,
+					"file_data": "data:" + mediaType + ";base64," + p.Document.Data,
+				},
+			})
 		}
 	}
-	return arr
+	return arr, nil
 }
 
 func toChatTools(tools []gage.ToolSchema) []map[string]any {
