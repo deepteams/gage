@@ -17,6 +17,8 @@ It gives you, behind clean interfaces:
   with header/bearer auth): tools (with live `tools/list_changed` sync),
   resources, prompts, and sampling backed by any `gage.Provider`.
 - **Skills**: load Claude Code–style `SKILL.md` folders.
+- **Memory**: a `MemoryStore` port, in-memory adapter, and
+  `memory_remember`/`memory_recall`/`memory_forget` tools.
 - **Agents**: an agentic loop with tool execution (sequential or parallel),
   permissions (allow/deny/rewrite/remember), hooks, context compaction,
   sub-agents, aggregated usage, and a terminal `Result`.
@@ -41,6 +43,7 @@ gage/                 core: Message, Event, Usage, Result + ports (Provider, Too
 ├── search/           SearchProvider impls (duckduckgo, brave, tavily)
 ├── mcp/              MCP client → gage.Tool bridge (+ resources, prompts, sampling)
 ├── skills/           SKILL.md loader + the "skill" tool
+├── memory/           in-memory MemoryStore + memory tools
 ├── jsonschema/       small JSON Schema builder for tool parameters
 ├── agent/            the agentic loop, hooks, compactors, sub-agents
 └── httpx/            SSE handler (no server)
@@ -225,9 +228,13 @@ approver := gage.ApproverFunc(func(ctx context.Context, r gage.PermissionRequest
     // Tool, Input, Agent, RunID, Turn, Metadata, and Summary.
     return askUserForApproval(ctx, r.Summary)
 })
-// gage.Remembering caches decisions marked Remember for the wrapper's lifetime.
-ag, _ := agent.New(agent.Config{Provider: p, Registry: reg, Approver: gage.Remembering(approver)})
+// gage.RememberingPerInput caches remembered decisions by tool+arguments.
+ag, _ := agent.New(agent.Config{Provider: p, Registry: reg, Approver: gage.RememberingPerInput(approver)})
 ```
+
+`gage.Remembering` is also available when you deliberately want broad caching
+by tool name. For write, shell, network, and other argument-sensitive tools,
+prefer `RememberingPerInput` or `RememberingBy` with an app-specific key.
 
 Built-in tools expose advisory `ToolMetadata` (`ReadOnly`, `Filesystem`,
 `Network`, `Shell`, `Destructive`, `RequiresApproval`, `Tags`) and concise call
@@ -301,6 +308,25 @@ reg.MustRegister(tools.NewWebTools(tools.WebConfig{Search: duckduckgo.New()})...
 addresses by default, including redirects. For trusted local/internal use only,
 set `tools.WebConfig{AllowPrivateHosts: true}`.
 
+`bash` sanitizes the environment, applies time/output limits, and kills the
+process group on timeout, but it is not an operating-system sandbox. Run
+untrusted shell work inside a container, VM, restricted user, or platform
+sandbox.
+
+## Memory
+
+```go
+import "github.com/deepteams/gage/memory"
+
+mem := memory.New()
+reg.MustRegister(memory.NewTools(mem)...)
+```
+
+The built-in store uses simple keyword recall and exact metadata filters, which
+is useful for tests and local agents. Production systems can implement
+`gage.MemoryStore` with a database, vector index, user-profile service, or
+tenant-scoped memory layer without changing the agent loop.
+
 ## MCP
 
 ```go
@@ -370,4 +396,6 @@ go test ./... -race
 
 ## License
 
-See repository.
+See [LICENSE](LICENSE). The repository is currently marked all-rights-reserved;
+replace it with MIT, Apache-2.0, or another intended license before publishing
+gage as an open-source library.

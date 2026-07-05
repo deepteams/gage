@@ -60,11 +60,36 @@ func toResponsesInput(msgs []gage.Message) []map[string]any {
 			out = append(out, map[string]any{
 				"type":    "message",
 				"role":    string(m.Role),
-				"content": []map[string]any{{"type": "input_text", "text": m.Text()}},
+				"content": contentToResponsesInput(m.Content),
 			})
 		}
 	}
 	return out
+}
+
+func contentToResponsesInput(parts []gage.ContentPart) []map[string]any {
+	content := make([]map[string]any, 0, len(parts))
+	for _, p := range parts {
+		switch p.Kind {
+		case gage.PartText:
+			content = append(content, map[string]any{"type": "input_text", "text": p.Text})
+		case gage.PartImage:
+			if p.Image == nil {
+				continue
+			}
+			url := p.Image.URL
+			if url == "" && p.Image.Data != "" {
+				url = "data:" + p.Image.MediaType + ";base64," + p.Image.Data
+			}
+			if url != "" {
+				content = append(content, map[string]any{"type": "input_image", "image_url": url})
+			}
+		}
+	}
+	if len(content) == 0 {
+		content = append(content, map[string]any{"type": "input_text", "text": ""})
+	}
+	return content
 }
 
 func toResponsesTools(tools []gage.ToolSchema) []map[string]any {

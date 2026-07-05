@@ -1,6 +1,7 @@
 package gage
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"sync"
@@ -61,27 +62,78 @@ func (f ApproverFunc) Approve(ctx context.Context, req PermissionRequest) (Appro
 	return f(ctx, req)
 }
 
+// PermissionCacheKeyFunc derives the cache key used by RememberingBy. Returning
+// an empty key disables caching for that request.
+type PermissionCacheKeyFunc func(req PermissionRequest) string
+
+// ToolPermissionKey caches remembered decisions by tool name only. This is
+// convenient for broad policies such as "always allow read-only tools", but it
+// is too coarse for tools whose risk depends on arguments.
+func ToolPermissionKey(req PermissionRequest) string { return req.Tool }
+
+// ToolAndInputPermissionKey caches remembered decisions by tool name and
+// canonical JSON input. It is the safer default for approvals of write, shell,
+// network, and other argument-sensitive tools.
+func ToolAndInputPermissionKey(req PermissionRequest) string {
+	return req.Tool + "\x00" + canonicalPermissionInput(req.Input)
+}
+
+func canonicalPermissionInput(input json.RawMessage) string {
+	if len(input) == 0 {
+		return "{}"
+	}
+	var buf bytes.Buffer
+	if err := json.Compact(&buf, input); err == nil {
+		return buf.String()
+	}
+	return string(input)
+}
+
 // Remembering wraps an Approver so decisions marked Remember are cached per
 // tool name and reused without consulting the inner Approver again. It is
 // concurrency-safe. The cache lives for the lifetime of the wrapper: scope it
 // to a session by creating one wrapper per session.
+//
+// For tools whose risk depends on their arguments, prefer RememberingPerInput
+// or RememberingBy with a policy-specific key.
 func Remembering(inner Approver) Approver {
-	return &rememberingApprover{inner: inner, cache: map[string]Approval{}}
+	return RememberingBy(inner, ToolPermissionKey)
+}
+
+// RememberingPerInput wraps an Approver so remembered decisions are cached by
+// tool name plus canonical JSON input. This avoids reusing an approval for one
+// path, command, URL, or payload on a different invocation of the same tool.
+func RememberingPerInput(inner Approver) Approver {
+	return RememberingBy(inner, ToolAndInputPermissionKey)
+}
+
+// RememberingBy wraps an Approver with a caller-defined cache key. Decisions
+// are cached only when the approval has Remember set and key returns non-empty.
+func RememberingBy(inner Approver, key PermissionCacheKeyFunc) Approver {
+	if key == nil {
+		key = ToolPermissionKey
+	}
+	return &rememberingApprover{inner: inner, key: key, cache: map[string]Approval{}}
 }
 
 type rememberingApprover struct {
 	inner Approver
+	key   PermissionCacheKeyFunc
 	mu    sync.RWMutex
 	cache map[string]Approval
 }
 
 func (r *rememberingApprover) Approve(ctx context.Context, req PermissionRequest) (Approval, error) {
+	key := r.key(req)
+	if key == "" {
+		return r.inner.Approve(ctx, req)
+	}
 	r.mu.RLock()
-	cached, ok := r.cache[req.Tool]
+	cached, ok := r.cache[key]
 	r.mu.RUnlock()
 	if ok {
-		// Cached decisions apply to the tool, not one concrete invocation:
-		// drop any per-call input rewrite.
+		// Cached decisions may apply beyond one concrete invocation: drop any
+		// per-call input rewrite.
 		cached.UpdatedInput = nil
 		return cached, nil
 	}
@@ -91,7 +143,7 @@ func (r *rememberingApprover) Approve(ctx context.Context, req PermissionRequest
 	}
 	if approval.Remember {
 		r.mu.Lock()
-		r.cache[req.Tool] = approval
+		r.cache[key] = approval
 		r.mu.Unlock()
 	}
 	return approval, nil

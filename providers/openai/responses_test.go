@@ -187,6 +187,35 @@ func TestResponsesReasoningReplay(t *testing.T) {
 	}
 }
 
+func TestResponsesInputPreservesImages(t *testing.T) {
+	input := toResponsesInput([]gage.Message{
+		{Role: gage.RoleUser, Content: []gage.ContentPart{
+			gage.TextPart("look"),
+			{Kind: gage.PartImage, Image: &gage.ImageSource{URL: "https://example.com/a.png"}},
+			{Kind: gage.PartImage, Image: &gage.ImageSource{MediaType: "image/png", Data: "abc123"}},
+		}},
+	})
+	if len(input) != 1 {
+		t.Fatalf("input = %v", input)
+	}
+	content, ok := input[0]["content"].([]map[string]any)
+	if !ok {
+		t.Fatalf("content = %#v", input[0]["content"])
+	}
+	if len(content) != 3 {
+		t.Fatalf("content = %v", content)
+	}
+	if content[0]["type"] != "input_text" || content[0]["text"] != "look" {
+		t.Fatalf("text part = %v", content[0])
+	}
+	if content[1]["type"] != "input_image" || content[1]["image_url"] != "https://example.com/a.png" {
+		t.Fatalf("url image = %v", content[1])
+	}
+	if content[2]["type"] != "input_image" || content[2]["image_url"] != "data:image/png;base64,abc123" {
+		t.Fatalf("inline image = %v", content[2])
+	}
+}
+
 func TestResponsesToolChoiceAndFormat(t *testing.T) {
 	events := [][2]string{{"response.completed", `{"response":{}}`}}
 	var reqBody []byte

@@ -4,7 +4,7 @@
 // defines the domain types (Message, ToolCall, Event, Usage, Result...) and
 // the ports (interfaces) that describe the capabilities the library needs —
 // Provider, Tool, ToolRegistry, SearchProvider, Approver, Compactor,
-// TokenStore and SessionStore. Concrete implementations (adapters) live in
+// MemoryStore, TokenStore and SessionStore. Concrete implementations (adapters) live in
 // sub-packages and depend on the core, never the other way around:
 //
 //   - providers/anthropic, providers/openrouter, providers/vllm,
@@ -15,6 +15,7 @@
 //   - mcp bridges Model Context Protocol servers into Tools (plus resources,
 //     prompts, and sampling).
 //   - skills loads SKILL.md skill folders.
+//   - memory implements an in-memory MemoryStore and memory tools.
 //   - jsonschema builds JSON Schema documents for tool parameters.
 //   - sessions implements SessionStore (in-memory and JSON files).
 //   - agent runs the agentic loop and streams Events.

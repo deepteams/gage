@@ -1,6 +1,7 @@
 package gage
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"testing"
@@ -143,5 +144,50 @@ func TestToolMetadataAndSummary(t *testing.T) {
 	plain := ToolFunc{ToolName: "plain"}
 	if got := CallSummaryOf(plain, json.RawMessage(`{"b":2, "a":1}`)); got != `plain {"b":2,"a":1}` {
 		t.Fatalf("plain summary = %q", got)
+	}
+}
+
+func TestRememberingPerInput(t *testing.T) {
+	calls := 0
+	inner := ApproverFunc(func(ctx context.Context, req PermissionRequest) (Approval, error) {
+		calls++
+		return Approval{Allow: true, Remember: true}, nil
+	})
+	approver := RememberingPerInput(inner)
+
+	reqA := PermissionRequest{Tool: "write_file", Input: json.RawMessage(`{"path":"a.txt","content":"x"}`)}
+	reqACompact := PermissionRequest{Tool: "write_file", Input: json.RawMessage(`{"path":"a.txt", "content":"x"}`)}
+	reqB := PermissionRequest{Tool: "write_file", Input: json.RawMessage(`{"path":"b.txt","content":"x"}`)}
+
+	if _, err := approver.Approve(context.Background(), reqA); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := approver.Approve(context.Background(), reqACompact); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := approver.Approve(context.Background(), reqB); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 2 {
+		t.Fatalf("inner calls = %d, want 2", calls)
+	}
+}
+
+func TestRememberingByCanSkipCache(t *testing.T) {
+	calls := 0
+	inner := ApproverFunc(func(ctx context.Context, req PermissionRequest) (Approval, error) {
+		calls++
+		return Approval{Allow: true, Remember: true}, nil
+	})
+	approver := RememberingBy(inner, func(req PermissionRequest) string { return "" })
+	req := PermissionRequest{Tool: "bash", Input: json.RawMessage(`{"command":"date"}`)}
+	if _, err := approver.Approve(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := approver.Approve(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 2 {
+		t.Fatalf("inner calls = %d, want 2", calls)
 	}
 }

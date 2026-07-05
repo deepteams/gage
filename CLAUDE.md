@@ -25,8 +25,8 @@ Everything streams end to end via `<-chan gage.Event`.
     estimation), `session.go` (`Checkpoint`, `Session`).
   - Ports (interfaces): `provider.go` (`Provider`), `tool.go` (`Tool`,
     `ToolRegistry`), `search.go` (`SearchProvider`), `permission.go`
-    (`Approver`), `compact.go` (`Compactor`), `auth.go` (`TokenStore`),
-    `session.go` (`SessionStore`).
+    (`Approver`), `compact.go` (`Compactor`), `memory.go` (`MemoryStore`),
+    `auth.go` (`TokenStore`), `session.go` (`SessionStore`).
 - **Adapters** (sub-packages): depend on the core, never the reverse.
   - `providers/` — `Provider` implementations. `providers/shared` has the HTTP
     client (retry), SSE parser, `Send` helper, and OAuth (PKCE, `TokenSource`,
@@ -43,6 +43,8 @@ Everything streams end to end via `<-chan gage.Event`.
     `gage.Tool`, plus resources, prompts, `tools/list_changed` sync, and
     sampling backed by a `gage.Provider`.
   - `skills/` — `SKILL.md` loader + the `skill` tool.
+  - `memory/` — in-memory `MemoryStore` + `memory_remember`,
+    `memory_recall`, and `memory_forget` tools.
   - `sessions/` — `SessionStore` impls (in-memory, JSON file store).
   - `agent/` — the loop (`loop.go`), config, hooks, compactors, sub-agents,
     pause/resume (`Resume`, `*Paused`).
@@ -91,6 +93,9 @@ returned `ErrApprovalPending`; the caller persists the checkpoint (see
 - Tool metadata is advisory and optional. Use `gage.ToolMetadataProvider` and
   `gage.ToolCallDescriber` to enrich client approval/audit UX, but keep policy
   decisions in caller-provided `Approver`s.
+- Use `gage.RememberingPerInput` or `gage.RememberingBy` for remembered
+  approvals of argument-sensitive tools. `gage.Remembering` intentionally
+  caches by tool name only.
 - Agent tool execution is hardened: per-tool timeouts are configured via
   `agent.Config.ToolTimeout`, tool panics are recovered into error results, and
   `agent.Observer` emits structured lifecycle observations for audit/metrics.
