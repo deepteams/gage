@@ -43,6 +43,24 @@ type Config struct {
 	// MaxTurns caps loop iterations (default 16). A turn is one provider call
 	// plus any tool executions it triggers.
 	MaxTurns int
+	// TokenBudget caps the total tokens (input + output, all provider calls
+	// including compaction) a run may consume. 0 means no budget. When the
+	// budget is reached the run fails with gage.ErrBudgetExceeded.
+	TokenBudget int
+	// MaxToolRepeats bounds consecutive identical tool calls (same name and
+	// input). 0 disables the guard. Past the threshold the call is not
+	// executed: the model first receives an error result telling it to change
+	// approach; if it repeats again, the run fails with gage.ErrLoopDetected.
+	MaxToolRepeats int
+	// MaxStreamRetries retries a turn whose provider stream fails with a
+	// retryable error (rate limit, 5xx, network) — including mid-stream, where
+	// the turn restarts: consumers should reset any partial message on the
+	// next message_start. 0 disables retries. Auth and unsupported-option
+	// errors are never retried.
+	MaxStreamRetries int
+	// RetryBaseDelay is the first backoff delay between stream retries; it
+	// doubles each attempt (default 500ms).
+	RetryBaseDelay time.Duration
 	// MaxParallelTools bounds how many of a turn's tool calls run
 	// concurrently. 0 or 1 means sequential execution. Tool-result events are
 	// emitted as executions finish, but results are fed back to the model in
@@ -62,6 +80,13 @@ func (c Config) maxTurns() int {
 		return c.MaxTurns
 	}
 	return 16
+}
+
+func (c Config) retryBaseDelay() time.Duration {
+	if c.RetryBaseDelay > 0 {
+		return c.RetryBaseDelay
+	}
+	return 500 * time.Millisecond
 }
 
 // systemPrompt combines the base system prompt with the skills preamble.

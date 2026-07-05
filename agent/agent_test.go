@@ -682,12 +682,12 @@ func TestCompactionTriggered(t *testing.T) {
 		{gage.MessageStart(), gage.TextDelta("done"), gage.UsageEvent(gage.Usage{InputTokens: 100}), gage.MessageDone(gage.StopEndTurn)},
 	}}
 	var compacted bool
-	comp := gage.CompactorFunc(func(ctx context.Context, msgs []gage.Message, u gage.Usage) ([]gage.Message, error) {
+	comp := gage.CompactorFunc(func(ctx context.Context, msgs []gage.Message, u gage.Usage) ([]gage.Message, gage.Usage, error) {
 		compacted = true
 		if u.InputTokens != 5000 {
 			t.Errorf("compactor usage = %+v", u)
 		}
-		return msgs, nil
+		return msgs, gage.Usage{}, nil
 	})
 	ag, _ := New(Config{Provider: mp, Registry: reg, Compactor: comp, CompactAfter: 1000})
 	if _, err := ag.RunSync(context.Background(), []gage.Message{gage.UserText("x")}); err != nil {
@@ -708,7 +708,7 @@ func TestTrimCompactorPreservesToolPairing(t *testing.T) {
 		gage.AssistantText("a3"),
 	}
 	// keep=3 would start the tail on the tool result; the cut must skip past it.
-	out, err := Trim(3).Compact(context.Background(), msgs, gage.Usage{})
+	out, _, err := Trim(3).Compact(context.Background(), msgs, gage.Usage{})
 	if err != nil {
 		t.Fatal(err)
 	}

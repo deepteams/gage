@@ -14,9 +14,9 @@ import (
 // message that requested it. Dropped content is replaced by a short user note
 // so the model knows history was elided.
 func Trim(keep int) gage.Compactor {
-	return gage.CompactorFunc(func(_ context.Context, msgs []gage.Message, _ gage.Usage) ([]gage.Message, error) {
+	return gage.CompactorFunc(func(_ context.Context, msgs []gage.Message, _ gage.Usage) ([]gage.Message, gage.Usage, error) {
 		if keep <= 0 || len(msgs) <= keep+1 {
-			return msgs, nil
+			return msgs, gage.Usage{}, nil
 		}
 		cut := len(msgs) - keep
 		// Never start the kept tail on a tool result whose tool_use was dropped.
@@ -24,13 +24,13 @@ func Trim(keep int) gage.Compactor {
 			cut++
 		}
 		if cut <= 1 || cut >= len(msgs) {
-			return msgs, nil
+			return msgs, gage.Usage{}, nil
 		}
 		out := make([]gage.Message, 0, len(msgs)-cut+2)
 		out = append(out, msgs[0])
 		out = append(out, gage.UserText(fmt.Sprintf("[%d earlier messages elided to fit the context window]", cut-1)))
 		out = append(out, msgs[cut:]...)
-		return out, nil
+		return out, gage.Usage{}, nil
 	})
 }
 
@@ -38,18 +38,19 @@ func Trim(keep int) gage.Compactor {
 // conversation with a model-written summary, keeping the first message and
 // the last keep messages verbatim. The summary call goes through p (using
 // model, which may be empty for provider-pinned models) and does not stream
-// to the caller.
+// to the caller; its token usage is returned so the agent counts it toward
+// the run total.
 func Summarize(p gage.Provider, model string, keep int) gage.Compactor {
-	return gage.CompactorFunc(func(ctx context.Context, msgs []gage.Message, _ gage.Usage) ([]gage.Message, error) {
+	return gage.CompactorFunc(func(ctx context.Context, msgs []gage.Message, _ gage.Usage) ([]gage.Message, gage.Usage, error) {
 		if keep <= 0 || len(msgs) <= keep+1 {
-			return msgs, nil
+			return msgs, gage.Usage{}, nil
 		}
 		cut := len(msgs) - keep
 		for cut < len(msgs) && msgs[cut].Role == gage.RoleTool {
 			cut++
 		}
 		if cut <= 1 || cut >= len(msgs) {
-			return msgs, nil
+			return msgs, gage.Usage{}, nil
 		}
 
 		var transcript strings.Builder
@@ -68,26 +69,31 @@ func Summarize(p gage.Provider, model string, keep int) gage.Compactor {
 		}
 		stream, err := p.Stream(ctx, req)
 		if err != nil {
-			return nil, fmt.Errorf("summarize compaction: %w", err)
+			return nil, gage.Usage{}, fmt.Errorf("summarize compaction: %w", err)
 		}
 		var summary strings.Builder
+		var used gage.Usage
 		for ev := range stream {
 			switch ev.Type {
 			case gage.EventTextDelta:
 				summary.WriteString(ev.Text)
+			case gage.EventUsage:
+				if ev.Usage != nil {
+					used = *ev.Usage
+				}
 			case gage.EventError:
-				return nil, fmt.Errorf("summarize compaction: %w", ev.Err)
+				return nil, used, fmt.Errorf("summarize compaction: %w", ev.Err)
 			}
 		}
 		if ctx.Err() != nil {
-			return nil, ctx.Err()
+			return nil, used, ctx.Err()
 		}
 
 		out := make([]gage.Message, 0, keep+2)
 		out = append(out, msgs[0])
 		out = append(out, gage.UserText("[Summary of the elided earlier conversation]\n"+summary.String()))
 		out = append(out, msgs[cut:]...)
-		return out, nil
+		return out, used, nil
 	})
 }
 

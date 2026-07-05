@@ -21,10 +21,12 @@ Everything streams end to end via `<-chan gage.Event`.
 - **Core** (root package `gage`): domain types + ports. Depends on nothing
   outside the stdlib.
   - Domain: `message.go`, `tool_call.go`, `event.go`, `usage.go`, `options.go`,
-    `result.go`, `model.go`, `errors.go`.
+    `result.go`, `model.go`, `errors.go`, `estimate.go` (heuristic token
+    estimation), `session.go` (`Checkpoint`, `Session`).
   - Ports (interfaces): `provider.go` (`Provider`), `tool.go` (`Tool`,
     `ToolRegistry`), `search.go` (`SearchProvider`), `permission.go`
-    (`Approver`), `compact.go` (`Compactor`), `auth.go` (`TokenStore`).
+    (`Approver`), `compact.go` (`Compactor`), `auth.go` (`TokenStore`),
+    `session.go` (`SessionStore`).
 - **Adapters** (sub-packages): depend on the core, never the reverse.
   - `providers/` — `Provider` implementations. `providers/shared` has the HTTP
     client (retry), SSE parser, `Send` helper, and OAuth (PKCE, `TokenSource`,
@@ -32,6 +34,8 @@ Everything streams end to end via `<-chan gage.Event`.
     and Responses (`responses.go`) wire formats; openrouter/vllm/ollama and
     codex build on them. `providers/anthropic` holds the reusable Messages wire
     format and the API-key provider; claudecode builds on it.
+    `providers/fallback` chains several providers: it fails over to the next
+    one when a provider errors before producing any content.
   - `tools/` — built-in tools, `Typed[T]` reflected tools, `MapRegistry`, the
     permission `Guard`, and the `LimitConcurrency`/`LimitResultSize` wrappers.
   - `search/` — `SearchProvider` impls (duckduckgo has no key).
@@ -39,7 +43,9 @@ Everything streams end to end via `<-chan gage.Event`.
     `gage.Tool`, plus resources, prompts, `tools/list_changed` sync, and
     sampling backed by a `gage.Provider`.
   - `skills/` — `SKILL.md` loader + the `skill` tool.
-  - `agent/` — the loop (`loop.go`), config, hooks, compactors, sub-agents.
+  - `sessions/` — `SessionStore` impls (in-memory, JSON file store).
+  - `agent/` — the loop (`loop.go`), config, hooks, compactors, sub-agents,
+    pause/resume (`Resume`, `*Paused`).
   - `httpx/` — SSE handler.
   - `jsonschema/` — JSON Schema builder for tool params (public).
 
@@ -61,7 +67,9 @@ preserves signed reasoning parts in history and encoders replay them (Anthropic
 extended thinking requires this). The agent relays all events (tagging `Turn`),
 inserts `tool_result` after executing tools, and ends with `done` carrying a
 `gage.Result` (full conversation, final text, stop reason, aggregated usage,
-turn count).
+turn count) — or with `paused` carrying a `gage.Checkpoint` when an `Approver`
+returned `ErrApprovalPending`; the caller persists the checkpoint (see
+`SessionStore`) and continues with `agent.Resume` plus the recorded decisions.
 
 ## Conventions
 
@@ -86,6 +94,14 @@ turn count).
 - Agent tool execution is hardened: per-tool timeouts are configured via
   `agent.Config.ToolTimeout`, tool panics are recovered into error results, and
   `agent.Observer` emits structured lifecycle observations for audit/metrics.
+- Agent runs are bounded by `MaxTurns`, `TokenBudget` (fails with
+  `ErrBudgetExceeded`; compaction usage counts too), and `MaxToolRepeats`
+  (identical consecutive tool calls get an error result, then the run fails
+  with `ErrLoopDetected`). `MaxStreamRetries` retries a turn on retryable
+  stream failures (never on `ErrAuth`/`ErrUnsupported`/cancellation).
+- Compaction triggers both proactively (heuristic `gage.EstimateTokens` before
+  the provider call, so an oversized first request never ships) and reactively
+  (provider-reported input tokens); a `Compactor` returns the usage it spent.
 - Built-in filesystem and web tools are security-sensitive. Keep root
   confinement symlink-safe, and keep `web_fetch` private-host blocking enabled
   by default unless the caller explicitly opts into trusted local/internal use.

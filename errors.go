@@ -22,6 +22,20 @@ var (
 	// ResponseFormat or ToolChoice) that the provider cannot honor. Providers
 	// fail fast with this error instead of silently dropping the option.
 	ErrUnsupported = errors.New("gage: option not supported by this provider")
+	// ErrBudgetExceeded indicates the agent run consumed its configured token
+	// budget before producing a final answer.
+	ErrBudgetExceeded = errors.New("gage: token budget exceeded")
+	// ErrLoopDetected indicates the agent kept issuing the same tool call with
+	// the same input past the configured repeat threshold.
+	ErrLoopDetected = errors.New("gage: tool call loop detected")
+	// ErrApprovalPending is returned by an Approver that cannot decide
+	// synchronously (e.g. the decision belongs to a human reviewing out of
+	// band). The agent then pauses the run: it emits an EventPaused carrying a
+	// Checkpoint and closes the stream; the caller persists the checkpoint and
+	// later resumes with the recorded decisions.
+	ErrApprovalPending = errors.New("gage: approval pending")
+	// ErrSessionNotFound indicates a SessionStore has no session for the id.
+	ErrSessionNotFound = errors.New("gage: session not found")
 )
 
 // Unsupported builds an ErrUnsupported-wrapping error naming the provider and

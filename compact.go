@@ -12,14 +12,17 @@ import "context"
 // pair), and the first message should remain a user message.
 type Compactor interface {
 	// Compact returns the replacement conversation. usage is the token usage
-	// of the latest provider call, giving the current input size. Returning
-	// the input slice unchanged (and a nil error) is a valid no-op.
-	Compact(ctx context.Context, msgs []Message, usage Usage) ([]Message, error)
+	// of the latest provider call, giving the current input size. The returned
+	// Usage reports what the compaction itself consumed (zero for local
+	// strategies, the summary call's usage for model-backed ones) so the agent
+	// can account for it in the run total. Returning the input slice unchanged
+	// (with a zero Usage and nil error) is a valid no-op.
+	Compact(ctx context.Context, msgs []Message, usage Usage) ([]Message, Usage, error)
 }
 
 // CompactorFunc adapts a function into a Compactor.
-type CompactorFunc func(ctx context.Context, msgs []Message, usage Usage) ([]Message, error)
+type CompactorFunc func(ctx context.Context, msgs []Message, usage Usage) ([]Message, Usage, error)
 
-func (f CompactorFunc) Compact(ctx context.Context, msgs []Message, usage Usage) ([]Message, error) {
+func (f CompactorFunc) Compact(ctx context.Context, msgs []Message, usage Usage) ([]Message, Usage, error) {
 	return f(ctx, msgs, usage)
 }

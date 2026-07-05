@@ -31,6 +31,10 @@ const (
 	EventMessageDone EventType = "message_done"
 	// EventError carries a terminal error; the stream closes after it.
 	EventError EventType = "error"
+	// EventPaused marks a run suspended awaiting out-of-band tool approval
+	// (emitted by the agent; the stream closes after it). Checkpoint carries
+	// everything needed to resume the run later.
+	EventPaused EventType = "paused"
 	// EventDone marks the end of the entire stream (emitted by the agent).
 	EventDone EventType = "done"
 )
@@ -57,6 +61,9 @@ type Event struct {
 	// Result summarizes the whole run. It is set on the terminal EventDone
 	// emitted by an agent (never by raw providers).
 	Result *Result `json:"result,omitempty"`
+	// Checkpoint is set on the terminal EventPaused emitted by an agent whose
+	// run is suspended awaiting tool approval.
+	Checkpoint *Checkpoint `json:"checkpoint,omitempty"`
 	// Err is set for EventError. It is not serialized directly; use ErrorString.
 	Err error `json:"-"`
 	// ErrorString mirrors Err for JSON transports.
@@ -113,6 +120,9 @@ func ErrorEvent(err error) Event {
 
 // DoneEvent builds an EventDone carrying the run summary.
 func DoneEvent(res *Result) Event { return Event{Type: EventDone, Result: res} }
+
+// PausedEvent builds an EventPaused carrying the resume checkpoint.
+func PausedEvent(cp *Checkpoint) Event { return Event{Type: EventPaused, Checkpoint: cp} }
 
 // WithTurn returns a copy of the event tagged with the given loop turn.
 func (e Event) WithTurn(turn int) Event {

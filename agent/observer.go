@@ -17,6 +17,12 @@ const (
 	ObservationTurnEnd   ObservationType = "turn_end"
 	ObservationToolStart ObservationType = "tool_start"
 	ObservationToolEnd   ObservationType = "tool_end"
+	// ObservationTurnRetry is emitted when a turn's provider stream failed
+	// with a retryable error and the loop is about to retry it.
+	ObservationTurnRetry ObservationType = "turn_retry"
+	// ObservationRunPaused is emitted when the run suspends awaiting
+	// out-of-band tool approval (see gage.ErrApprovalPending).
+	ObservationRunPaused ObservationType = "run_paused"
 )
 
 // Observation is a structured audit/telemetry event. It intentionally uses
