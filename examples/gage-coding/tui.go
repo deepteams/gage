@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -11,6 +12,12 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/deepteams/gage"
 )
+
+// isTerminalAbort reports whether err is Bubble Tea's cancellation sentinel, so
+// the caller can exit 0 on a normal quit instead of printing a failure.
+func isTerminalAbort(err error) bool {
+	return errors.Is(err, tea.ErrProgramKilled)
+}
 
 type approvalEnvelope struct {
 	req  gage.PermissionRequest
@@ -90,7 +97,6 @@ type tuiModel struct {
 	textStart int
 	textOpen  bool
 	width     int
-	height    int
 	lastUsage string
 }
 
@@ -123,6 +129,9 @@ func runTUI(ctx context.Context, app *appRuntime, initial agentMode, auto bool) 
 			dimStyle.Render("Welcome to gage-coding. Try /help, /mode plan, /init, /commands, or ask for a code change."),
 		},
 	}
+	if auto {
+		m.lines = append(m.lines, errStyle.Render("⚠ approval prompts disabled (-auto/-yolo): every tool call runs unattended"))
+	}
 	m.syncViewport()
 	_, err := tea.NewProgram(m, tea.WithAltScreen()).Run()
 	return err
@@ -136,7 +145,7 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
-		m.width, m.height = msg.Width, msg.Height
+		m.width = msg.Width
 		m.viewport.Width = msg.Width
 		m.viewport.Height = max(5, msg.Height-7)
 		m.input.Width = max(20, msg.Width-4)
@@ -188,6 +197,14 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.flushText()
 			m.running = false
 			m.runCh = nil
+			// If the run ended while a question prompt was still pending (e.g.
+			// the run was cancelled), clear it so the input box does not stay
+			// locked in answer mode, and re-arm the question listener.
+			if m.question != nil {
+				m.question = nil
+				m.input.Placeholder = "Ask for a change, or /help"
+				cmds = append(cmds, waitQuestion(m.interact.questions))
+			}
 			if msg.Err != nil {
 				m.appendLine(errStyle.Render("run failed: " + msg.Err.Error()))
 			} else if msg.Summary != "" {
@@ -271,13 +288,23 @@ func (m *tuiModel) startRun(prompt string, mode agentMode) tea.Cmd {
 	m.appendLine(modeStyle.Render("you ["+string(mode)+"]: ") + prompt)
 	ch := make(chan runMsg, 32)
 	m.runCh = ch
+	ctx := m.ctx
 	go func() {
-		_, summary, err := m.app.RunPrompt(m.ctx, prompt, mode, func(ev gage.Event) {
+		defer close(ch)
+		// Always select on ctx.Done() when sending: if the TUI exits mid-run
+		// nothing drains ch, and a bare send on the full buffer would block the
+		// goroutine (and the agent run it drives) forever.
+		_, summary, err := m.app.RunPrompt(ctx, prompt, mode, func(ev gage.Event) {
 			evCopy := ev
-			ch <- runMsg{Event: &evCopy}
+			select {
+			case ch <- runMsg{Event: &evCopy}:
+			case <-ctx.Done():
+			}
 		})
-		ch <- runMsg{Done: true, Summary: summary, Err: err}
-		close(ch)
+		select {
+		case ch <- runMsg{Done: true, Summary: summary, Err: err}:
+		case <-ctx.Done():
+		}
 	}()
 	return waitRun(ch)
 }
@@ -410,11 +437,4 @@ func waitQuestion(ch <-chan *questionEnvelope) tea.Cmd {
 		env := <-ch
 		return questionMsg{env: env}
 	}
-}
-
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
 }

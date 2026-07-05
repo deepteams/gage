@@ -770,7 +770,11 @@ type toolOutcome struct {
 
 func (a *Agent) callTool(ctx context.Context, tool gage.Tool, input json.RawMessage, toolName string) toolOutcome {
 	timeout := a.cfg.ToolTimeout
-	if timeout <= 0 {
+	// Tools that declare LongRunning opt out of the per-tool timeout: they may
+	// legitimately block for a long time (e.g. an approval or a question tool
+	// waiting on the user) and must not be abandoned mid-flight. Cancellation
+	// still flows through ctx.
+	if timeout <= 0 || gage.MetadataOf(tool).LongRunning {
 		return callToolDirect(ctx, tool, input)
 	}
 	execCtx, cancel := context.WithTimeout(ctx, timeout)

@@ -19,36 +19,33 @@ import (
 // codex provider picks up the stored tokens and refreshes them transparently.
 // providers/claudecode works the same way for Claude subscriptions.
 
-// codexTokenPath stores the ChatGPT OAuth tokens outside the workspace, under
-// the user config dir, so they never end up in a repo. gage never hard-codes
-// token paths in providers: where credentials live is the consumer's choice,
-// expressed through the gage.TokenStore port.
-func codexTokenPath() (string, error) {
+// oauthFileStore returns a file-backed TokenStore (and its path) under the user
+// config dir, so OAuth tokens live outside the workspace and never end up in a
+// repo. gage never hard-codes token paths in providers: where credentials live
+// is the consumer's choice, expressed through the gage.TokenStore port. For
+// production use, prefer oauth.NewEncryptedFileStore or an OS keychain.
+func oauthFileStore(filename string) (gage.TokenStore, string, error) {
 	dir, err := os.UserConfigDir()
 	if err != nil {
-		return "", err
+		return nil, "", err
 	}
-	return filepath.Join(dir, "gage-coding", "codex.json"), nil
+	path := filepath.Join(dir, "gage-coding", filename)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, "", err
+	}
+	return oauth.NewFileStore(path), path, nil
 }
 
 // codexStore returns the file-backed TokenStore for the Codex credentials.
-// For production use, prefer oauth.NewEncryptedFileStore or an OS keychain.
-func codexStore() (gage.TokenStore, error) {
-	path, err := codexTokenPath()
-	if err != nil {
-		return nil, err
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return nil, err
-	}
-	return oauth.NewFileStore(path), nil
+func codexStore() (gage.TokenStore, string, error) {
+	return oauthFileStore("codex.json")
 }
 
 // codexLogin runs the interactive OAuth (PKCE) flow: it briefly binds the
 // localhost callback the Codex client id expects, opens the browser on the
 // authorization URL, and persists the tokens in the store.
 func codexLogin(ctx context.Context) error {
-	store, err := codexStore()
+	store, path, err := codexStore()
 	if err != nil {
 		return err
 	}
@@ -59,7 +56,6 @@ func codexLogin(ctx context.Context) error {
 	}); err != nil {
 		return err
 	}
-	path, _ := codexTokenPath()
 	fmt.Println("logged in; credentials saved to", path)
 	return nil
 }
@@ -67,7 +63,7 @@ func codexLogin(ctx context.Context) error {
 // codexProvider returns a Codex provider when stored credentials exist. The
 // provider refreshes expired tokens on its own and retries once on a 401.
 func codexProvider(ctx context.Context, model string) (gage.Provider, string, bool) {
-	store, err := codexStore()
+	store, _, err := codexStore()
 	if err != nil {
 		return nil, "", false
 	}

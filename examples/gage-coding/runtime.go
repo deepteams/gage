@@ -5,9 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/deepteams/gage"
@@ -119,7 +119,6 @@ func (a *appRuntime) SetInteractors(approval approvalAsker, question questionAsk
 	a.auto = auto
 	a.approver = gage.RememberingPerInput(&configuredApprover{
 		policy: a.policy,
-		tools:  a.cfg.Tools,
 		auto:   auto,
 		asker:  approval,
 	})
@@ -140,6 +139,7 @@ func (a *appRuntime) RunPrompt(ctx context.Context, prompt string, mode agentMod
 	}
 
 	var res *gage.Result
+	var paused *gage.Checkpoint
 	var runErr error
 	for ev := range stream {
 		if emit != nil {
@@ -149,36 +149,56 @@ func (a *appRuntime) RunPrompt(ctx context.Context, prompt string, mode agentMod
 		case gage.EventDone:
 			res = ev.Result
 		case gage.EventPaused:
-			if a.store != nil {
-				runErr = a.store.SaveSession(ctx, a.sessionID, gage.Session{
-					Messages:   ev.Checkpoint.Messages,
-					Checkpoint: ev.Checkpoint,
-				})
-			}
+			paused = ev.Checkpoint
 		case gage.EventError:
 			runErr = ev.Err
 		}
 	}
+
 	if runErr != nil {
+		// The turn failed mid-flight. Commit (not discard) any file changes the
+		// tools already applied so /undo can still revert them, then drop the
+		// dangling user message so the conversation stays consistent.
+		a.snapshots.Commit()
 		a.history = a.history[:len(a.history)-1]
-		a.snapshots.Discard()
 		return nil, "", runErr
 	}
+
+	if paused != nil {
+		// The approver deferred the decision (ErrApprovalPending). Keep the
+		// applied changes undoable, align in-memory history with the checkpoint
+		// we persist, and tell the user instead of silently swallowing the run.
+		a.snapshots.Commit()
+		a.history = paused.Messages
+		if a.store != nil {
+			if err := a.store.SaveSession(ctx, a.sessionID, gage.Session{
+				Messages:   paused.Messages,
+				Checkpoint: paused,
+			}); err != nil {
+				return nil, "", fmt.Errorf("save paused checkpoint: %w", err)
+			}
+		}
+		return nil, "run paused awaiting approval; checkpoint saved", nil
+	}
+
 	if res == nil {
 		a.history = a.history[:len(a.history)-1]
 		a.snapshots.Discard()
 		return nil, "", nil
 	}
+
 	a.history = res.Messages
 	changed := a.snapshots.Commit()
-	if a.store != nil {
-		if err := a.store.SaveSession(ctx, a.sessionID, gage.Session{Messages: a.history}); err != nil {
-			return res, "", err
-		}
-	}
 	summary := runSummary(res, a.modelID)
 	if changed > 0 {
 		summary += fmt.Sprintf(" · %d tracked file(s)", changed)
+	}
+	if a.store != nil {
+		if err := a.store.SaveSession(ctx, a.sessionID, gage.Session{Messages: a.history}); err != nil {
+			// A successful turn must not be reported as failed just because the
+			// session could not be persisted; surface it as a warning instead.
+			summary += fmt.Sprintf(" · warning: session not saved: %v", err)
+		}
 	}
 	return res, summary, nil
 }
@@ -261,7 +281,17 @@ func toolAllowedInMode(mode agentMode, t gage.Tool) bool {
 		}
 		return meta.ReadOnly && !meta.Shell && !meta.Destructive && !meta.RequiresApproval
 	case modeReview:
-		return name != "write_file" && name != "edit"
+		// Review inspects and may run shell verification, but must not mutate
+		// the workspace. Filter on metadata so mutating MCP servers and future
+		// built-ins are blocked too — not just write_file/edit by name. Bash
+		// stays for verification; the permission layer still gates each command.
+		if name == "bash" {
+			return true
+		}
+		if meta.Destructive || (meta.Filesystem && !meta.ReadOnly) || meta.RequiresApproval {
+			return false
+		}
+		return true
 	default:
 		return true
 	}
@@ -271,7 +301,10 @@ func (a *appRuntime) toolEnabled(t gage.Tool) bool {
 	if len(a.cfg.Tools) == 0 {
 		return true
 	}
-	keys := []string{t.Name(), toolPermissionKey(t)}
+	// Consult the tool name, its permission category, and the "*" catch-all so
+	// {"tools": {"*": false}} disables everything (registry filtering is the
+	// single enforcement point; the approver no longer re-checks this).
+	keys := []string{t.Name(), toolPermissionKey(t), "*"}
 	for _, key := range keys {
 		if enabled, ok := a.cfg.Tools[key]; ok && !enabled {
 			return false
@@ -306,27 +339,62 @@ underspecified enough that guessing would risk the wrong target or scope.
 }
 
 func (a *appRuntime) connectMCP(ctx context.Context) error {
-	for name, cfg := range a.cfg.MCP {
+	// The servers are independent, so dial them concurrently: startup latency
+	// becomes the slowest single connect rather than the sum of all of them.
+	names := sortedKeys(a.cfg.MCP)
+	type result struct {
+		client *mcp.Client
+		tools  []gage.Tool
+		err    error
+	}
+	results := make([]result, len(names))
+	var wg sync.WaitGroup
+	for i, name := range names {
+		cfg := a.cfg.MCP[name]
 		if cfg.Enabled != nil && !*cfg.Enabled {
 			continue
 		}
-		timeout := 5 * time.Second
-		if cfg.TimeoutMS > 0 {
-			timeout = time.Duration(cfg.TimeoutMS) * time.Millisecond
+		wg.Add(1)
+		go func(i int, name string, cfg mcpServerConfig) {
+			defer wg.Done()
+			timeout := 5 * time.Second
+			if cfg.TimeoutMS > 0 {
+				timeout = time.Duration(cfg.TimeoutMS) * time.Millisecond
+			}
+			cctx, cancel := context.WithTimeout(ctx, timeout)
+			client, err := a.connectOneMCP(cctx, name, cfg)
+			cancel()
+			if err != nil {
+				results[i] = result{err: fmt.Errorf("mcp %s: %w", name, err)}
+				return
+			}
+			ts, err := client.Tools(ctx)
+			if err != nil {
+				_ = client.Close()
+				results[i] = result{err: fmt.Errorf("mcp %s: %w", name, err)}
+				return
+			}
+			results[i] = result{client: client, tools: ts}
+		}(i, name, cfg)
+	}
+	wg.Wait()
+
+	for _, r := range results {
+		if r.err == nil {
+			continue
 		}
-		cctx, cancel := context.WithTimeout(ctx, timeout)
-		client, err := a.connectOneMCP(cctx, name, cfg)
-		cancel()
-		if err != nil {
-			return err
+		for _, other := range results {
+			if other.client != nil {
+				_ = other.client.Close()
+			}
 		}
-		ts, err := client.Tools(ctx)
-		if err != nil {
-			_ = client.Close()
-			return err
+		return r.err
+	}
+	for _, r := range results {
+		if r.client != nil {
+			a.mcpClients = append(a.mcpClients, r.client)
+			a.mcpTools = append(a.mcpTools, r.tools...)
 		}
-		a.mcpClients = append(a.mcpClients, client)
-		a.mcpTools = append(a.mcpTools, ts...)
 	}
 	return nil
 }
@@ -577,13 +645,4 @@ func toolInputString(raw json.RawMessage, max int) string {
 		return "{}"
 	}
 	return s
-}
-
-func isTerminalAbort(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "program was killed")
-}
-
-func fileExists(path string) bool {
-	_, err := os.Stat(path)
-	return err == nil
 }

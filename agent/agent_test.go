@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/deepteams/gage"
+	"github.com/deepteams/gage/jsonschema"
 	"github.com/deepteams/gage/tools"
 )
 
@@ -327,6 +328,34 @@ func TestAgentToolTimeout(t *testing.T) {
 	}
 	if res == nil || !res.IsError || !strings.Contains(res.Text(), "timed out") {
 		t.Fatalf("expected timeout tool result, got %+v", res)
+	}
+}
+
+func TestAgentLongRunningToolSkipsTimeout(t *testing.T) {
+	reg := tools.NewRegistry()
+	reg.MustRegister(tools.FuncWithMetadata("ask", "long-running", jsonschema.Object(nil),
+		gage.ToolMetadata{LongRunning: true},
+		func(ctx context.Context, input json.RawMessage) (gage.ToolResult, error) {
+			// Blocks well past ToolTimeout; LongRunning must exempt it so it is
+			// not abandoned mid-flight.
+			time.Sleep(40 * time.Millisecond)
+			return gage.TextResult("", "answered"), nil
+		}))
+	mp := &mockProvider{turns: [][]gage.Event{
+		{gage.MessageStart(), toolCallDone("c1", "ask", `{}`), gage.MessageDone("tool_use")},
+		{gage.MessageStart(), gage.TextDelta("done"), gage.MessageDone("end_turn")},
+	}}
+	ag, _ := New(Config{Provider: mp, Registry: reg, ToolTimeout: 5 * time.Millisecond})
+	ch, _ := ag.Run(context.Background(), []gage.Message{gage.UserText("x")})
+
+	var res *gage.ToolResult
+	for e := range ch {
+		if e.Type == gage.EventToolResult {
+			res = e.ToolResult
+		}
+	}
+	if res == nil || res.IsError || !strings.Contains(res.Text(), "answered") {
+		t.Fatalf("expected long-running tool to complete without timeout, got %+v", res)
 	}
 }
 

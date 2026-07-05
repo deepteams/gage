@@ -19,7 +19,6 @@ type customCommand struct {
 	Description string
 	Template    string
 	Mode        agentMode
-	Source      string
 }
 
 type commandFrontmatter struct {
@@ -39,7 +38,6 @@ func loadCommands(root string, inline map[string]inlineCommand) (*commandSet, er
 			Description: cmd.Description,
 			Template:    cmd.Template,
 			Mode:        mode,
-			Source:      "config",
 		}
 	}
 
@@ -49,7 +47,7 @@ func loadCommands(root string, inline map[string]inlineCommand) (*commandSet, er
 	}
 	sort.Strings(files)
 	for _, file := range files {
-		cmd, err := loadCommandFile(root, file)
+		cmd, err := loadCommandFile(file)
 		if err != nil {
 			return nil, err
 		}
@@ -58,12 +56,15 @@ func loadCommands(root string, inline map[string]inlineCommand) (*commandSet, er
 	return set, nil
 }
 
-func loadCommandFile(root, path string) (customCommand, error) {
+func loadCommandFile(path string) (customCommand, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return customCommand{}, err
 	}
-	body := strings.TrimSpace(string(raw))
+	// Normalize CRLF so frontmatter parsing works on Windows checkouts (a
+	// "---\r\n" opener would otherwise skip parsing and leak raw YAML into the
+	// prompt).
+	body := strings.TrimSpace(strings.ReplaceAll(string(raw), "\r\n", "\n"))
 	var fm commandFrontmatter
 	if strings.HasPrefix(body, "---\n") {
 		rest := body[len("---\n"):]
@@ -84,7 +85,6 @@ func loadCommandFile(root, path string) (customCommand, error) {
 		Description: fm.Description,
 		Template:    body,
 		Mode:        mode,
-		Source:      relDisplay(root, path),
 	}, nil
 }
 
@@ -109,14 +109,5 @@ func (s *commandSet) List() []customCommand {
 }
 
 func expandCommand(cmd customCommand, args string) string {
-	fields := strings.Fields(args)
-	out := strings.ReplaceAll(cmd.Template, "$ARGUMENTS", args)
-	for i := 1; i <= 9; i++ {
-		value := ""
-		if i <= len(fields) {
-			value = fields[i-1]
-		}
-		out = strings.ReplaceAll(out, fmt.Sprintf("$%d", i), value)
-	}
-	return strings.TrimSpace(out)
+	return strings.TrimSpace(strings.ReplaceAll(cmd.Template, "$ARGUMENTS", args))
 }

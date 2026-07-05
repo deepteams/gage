@@ -5,35 +5,20 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 
 	"github.com/deepteams/gage"
 	"github.com/deepteams/gage/providers/claudecode"
-	"github.com/deepteams/gage/providers/shared/oauth"
 )
 
-func claudeTokenPath() (string, error) {
-	dir, err := os.UserConfigDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(dir, "gage-coding", "claudecode.json"), nil
-}
-
-func claudeStore() (gage.TokenStore, error) {
-	path, err := claudeTokenPath()
-	if err != nil {
-		return nil, err
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return nil, err
-	}
-	return oauth.NewFileStore(path), nil
+// claudeStore returns the file-backed TokenStore for the Claude credentials.
+// It shares oauthFileStore with the Codex flow (see codex.go).
+func claudeStore() (gage.TokenStore, string, error) {
+	return oauthFileStore("claudecode.json")
 }
 
 func claudeLogin(ctx context.Context, console bool) error {
-	store, err := claudeStore()
+	store, path, err := claudeStore()
 	if err != nil {
 		return err
 	}
@@ -51,13 +36,12 @@ func claudeLogin(ctx context.Context, console bool) error {
 	if _, err := complete(ctx, store, strings.TrimSpace(line)); err != nil {
 		return err
 	}
-	path, _ := claudeTokenPath()
 	fmt.Println("logged in; credentials saved to", path)
 	return nil
 }
 
 func claudeProvider(ctx context.Context, model string) (gage.Provider, string, bool) {
-	store, err := claudeStore()
+	store, _, err := claudeStore()
 	if err != nil {
 		return nil, "", false
 	}

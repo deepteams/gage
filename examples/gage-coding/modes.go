@@ -14,10 +14,8 @@ const (
 )
 
 type modeSpec struct {
-	Name        agentMode
-	Label       string
-	Description string
-	System      string
+	Label  string
+	System string
 }
 
 func parseMode(raw string) (agentMode, error) {
@@ -45,9 +43,7 @@ func specForMode(mode agentMode) modeSpec {
 	switch mode {
 	case modePlan:
 		return modeSpec{
-			Name:        modePlan,
-			Label:       "Plan",
-			Description: "read-only planning; no file writes or shell commands",
+			Label: "Plan",
 			System: `Mode: Plan.
 You may inspect the workspace and ask clarifying questions, but you must not
 modify files or run shell commands. Produce a concise implementation plan with
@@ -55,9 +51,7 @@ risks, validation steps, and files likely to change.`,
 		}
 	case modeReview:
 		return modeSpec{
-			Name:        modeReview,
-			Label:       "Review",
-			Description: "code-review posture; no edits, shell verification can be requested",
+			Label: "Review",
 			System: `Mode: Review.
 Take a code-review stance. Prioritize bugs, behavioral regressions, security
 risks, and missing tests. Do not modify files. Findings should be concrete,
@@ -65,9 +59,7 @@ ordered by severity, and reference files/symbols when possible.`,
 		}
 	default:
 		return modeSpec{
-			Name:        modeBuild,
-			Label:       "Build",
-			Description: "full coding mode with guarded edits and commands",
+			Label: "Build",
 			System: `Mode: Build.
 Inspect before changing code, make targeted edits, maintain the repository's
 style, and verify with the smallest meaningful build, lint, or test command.

@@ -80,6 +80,9 @@ func runREPL(ctx context.Context, app *appRuntime, mode agentMode, auto bool) er
 	term := &terminalInteractor{in: stdin, out: os.Stdout}
 	app.SetInteractors(term, term, auto)
 	fmt.Printf("gage-coding · %s · root %s · mode %s (/help to list commands)\n", app.modelID, app.root, mode)
+	if auto {
+		fmt.Println("\x1b[33m⚠ approval prompts disabled (-auto/-yolo): every tool call runs unattended\x1b[0m")
+	}
 	r := &renderer{out: os.Stdout}
 	for {
 		fmt.Print("\n> ")
@@ -109,9 +112,22 @@ func runREPL(ctx context.Context, app *appRuntime, mode agentMode, auto bool) er
 			if res.Prompt == "" {
 				continue
 			}
-			line = res.Prompt
-			mode = res.Mode
-			fmt.Printf("expanded command in %s mode:\n%s\n", mode, line)
+			// A custom command's frontmatter mode applies to this run only; it
+			// must not silently switch the session mode (use /mode for that).
+			runMode := res.Mode
+			fmt.Printf("expanded command in %s mode:\n%s\n", runMode, res.Prompt)
+			_, summary, err := app.RunPrompt(ctx, res.Prompt, runMode, r.handle)
+			if err != nil {
+				if ctx.Err() != nil {
+					return nil
+				}
+				fmt.Fprintf(os.Stderr, "\nrun failed: %v\n", err)
+				continue
+			}
+			if summary != "" {
+				fmt.Printf("\x1b[2m%s\x1b[0m\n", summary)
+			}
+			continue
 		}
 		_, summary, err := app.RunPrompt(ctx, line, mode, r.handle)
 		if err != nil {

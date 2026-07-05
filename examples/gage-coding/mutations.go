@@ -123,10 +123,13 @@ func (s *snapshotManager) Undo() (string, error) {
 		return "nothing to undo", nil
 	}
 	cs := s.undo[len(s.undo)-1]
-	s.undo = s.undo[:len(s.undo)-1]
+	// Apply before mutating the stacks: if a write fails partway (e.g. a file
+	// was made read-only), leave the changeset on the undo stack so the user can
+	// fix the cause and retry instead of losing the recorded states.
 	if err := s.apply(cs, false); err != nil {
 		return "", err
 	}
+	s.undo = s.undo[:len(s.undo)-1]
 	s.redo = append(s.redo, cs)
 	return fmt.Sprintf("undid %d file change(s) from: %s", len(cs.Changes), cs.Prompt), nil
 }
@@ -138,10 +141,10 @@ func (s *snapshotManager) Redo() (string, error) {
 		return "nothing to redo", nil
 	}
 	cs := s.redo[len(s.redo)-1]
-	s.redo = s.redo[:len(s.redo)-1]
 	if err := s.apply(cs, true); err != nil {
 		return "", err
 	}
+	s.redo = s.redo[:len(s.redo)-1]
 	s.undo = append(s.undo, cs)
 	return fmt.Sprintf("redid %d file change(s) from: %s", len(cs.Changes), cs.Prompt), nil
 }
@@ -172,23 +175,49 @@ func (s *snapshotManager) apply(cs *changeSet, redo bool) error {
 	return nil
 }
 
+// resolve confines a path to the workspace root, evaluating symlinks the way
+// tools.FSConfig does: a purely lexical check would let an in-root symlink (or a
+// symlinked parent) redirect a snapshot write/delete outside the root on undo.
+// It resolves the deepest existing ancestor and rejects anything whose real
+// path escapes the real root.
 func (s *snapshotManager) resolve(path string) (abs string, rel string, err error) {
 	if path == "" {
 		return "", "", fmt.Errorf("empty path")
 	}
+	root, err := realPath(s.root)
+	if err != nil {
+		return "", "", err
+	}
 	if filepath.IsAbs(path) {
 		abs = filepath.Clean(path)
 	} else {
-		abs = filepath.Join(s.root, path)
+		abs = filepath.Join(root, path)
 	}
-	rel, err = filepath.Rel(s.root, abs)
+	real := abs
+	if resolved, rerr := filepath.EvalSymlinks(abs); rerr == nil {
+		real = resolved
+	} else if resolved, rerr := filepath.EvalSymlinks(filepath.Dir(abs)); rerr == nil {
+		real = filepath.Join(resolved, filepath.Base(abs))
+	}
+	rel, err = filepath.Rel(root, real)
 	if err != nil {
 		return "", "", err
 	}
 	if rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
 		return "", "", fmt.Errorf("path %q escapes root", path)
 	}
-	return abs, rel, nil
+	return real, rel, nil
+}
+
+func realPath(p string) (string, error) {
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return "", err
+	}
+	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+		return resolved, nil
+	}
+	return abs, nil
 }
 
 func readFileState(path string) (fileState, error) {
@@ -256,7 +285,7 @@ func (f *formatterManager) Format(ctx context.Context, path string) (string, err
 	cmd.Dir = f.root
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return "", fmt.Errorf("formatter %s failed: %s%v", cmdline[0], string(out), err)
+		return "", fmt.Errorf("formatter %s failed: %s: %w", cmdline[0], string(out), err)
 	}
 	return strings.Join(append([]string{cmdline[0]}, args...), " "), nil
 }
