@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -75,6 +76,28 @@ func TestEditRejectsEmptyOldString(t *testing.T) {
 	res := run(t, edit, `{"path":"f.txt","old_string":"","new_string":"x","replace_all":true}`)
 	if !res.IsError || !strings.Contains(res.Text(), "must not be empty") {
 		t.Fatalf("expected empty old_string error, got %q", res.Text())
+	}
+}
+
+func TestFSAbsolutePathInsideRoot(t *testing.T) {
+	root := t.TempDir()
+	fs := NewFSTools(FSConfig{Root: root})
+	write := toolByName(fs, "write_file")
+	read := toolByName(fs, "read_file")
+	list := toolByName(fs, "list_dir")
+
+	abs := filepath.Join(root, "sub", "a.txt")
+	run(t, write, `{"path":`+strconv.Quote(abs)+`,"content":"hello"}`)
+	if got := run(t, read, `{"path":`+strconv.Quote(abs)+`}`).Text(); got != "hello" {
+		t.Fatalf("read via absolute path = %q", got)
+	}
+	if got := run(t, list, `{"path":`+strconv.Quote(root)+`}`).Text(); got != "sub/" {
+		t.Fatalf("list via absolute root = %q", got)
+	}
+
+	res := run(t, read, `{"path":"/etc/passwd"}`)
+	if !res.IsError || !strings.Contains(res.Text(), "escapes root") {
+		t.Fatalf("expected confinement error for outside absolute path, got %q", res.Text())
 	}
 }
 

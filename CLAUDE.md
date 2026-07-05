@@ -76,6 +76,10 @@ Everything streams end to end via `<-chan gage.Event`.
     `otelgage`): `agent.Observer` → OpenTelemetry spans (GenAI semconv). Kept
     out of the root module so the core stays dependency-light; it uses a
     `replace => ../` for in-repo dev and is consumable once the repo is tagged.
+  - `examples/` — runnable example programs, each a **nested Go module** with a
+    `replace => ../..` so the library itself keeps zero `main` packages.
+    `examples/gage-coding` is an interactive coding-agent CLI showing the
+    intended wiring (providers, tools, Approver, compaction, sessions).
 
 **Rule:** never import an adapter package from the core. If the core needs a
 capability, express it as a port (interface) and let an adapter implement it.

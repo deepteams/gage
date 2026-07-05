@@ -31,8 +31,11 @@ func (c FSConfig) maxRead() int64 {
 	return 1 << 20
 }
 
-// resolve joins a user path against Root and prevents lexical escapes. Call
-// resolveExisting or resolveForWrite when the target may involve symlinks.
+// resolve joins a user path against Root and prevents lexical escapes. An
+// absolute path is accepted when it already points inside Root — models
+// routinely echo back absolute paths they saw in prompts or tool results.
+// Call resolveExisting or resolveForWrite when the target may involve
+// symlinks.
 func (c FSConfig) resolve(p string) (string, error) {
 	if c.Root == "" {
 		return p, nil
@@ -40,6 +43,13 @@ func (c FSConfig) resolve(p string) (string, error) {
 	root, err := filepath.Abs(c.Root)
 	if err != nil {
 		return "", err
+	}
+	if filepath.IsAbs(p) {
+		abs := filepath.Clean(p)
+		if abs != root && !strings.HasPrefix(abs, root+string(os.PathSeparator)) {
+			return "", fmt.Errorf("path %q escapes root; use paths relative to the workspace root", p)
+		}
+		return abs, nil
 	}
 	joined := filepath.Join(root, p)
 	if joined != root && !strings.HasPrefix(joined, root+string(os.PathSeparator)) {

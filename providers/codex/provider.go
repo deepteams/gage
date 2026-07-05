@@ -11,7 +11,7 @@ import (
 )
 
 // DefaultModel is used when Request.Model is empty.
-const DefaultModel = "gpt-5-codex"
+const DefaultModel = "gpt-5.5"
 
 type provider struct {
 	client *openai.ResponsesClient
