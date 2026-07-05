@@ -37,6 +37,32 @@ Provider precedence: stored codex tokens → `ANTHROPIC_API_KEY` →
   exit. Tokens are stored under your user config dir
   (`~/Library/Application Support/gage-coding/codex.json` on macOS,
   `~/.config/gage-coding/codex.json` on Linux) and refreshed transparently.
+- `-skills` — directory of SKILL.md skill folders, resolved against `-root`
+  (default `.agents/skills`, the cross-tool convention for per-project
+  skills — so pointing `-root` at any project picks up that project's own
+  skills). A missing directory simply means no skills.
+
+## Skills and the explore sub-agent
+
+Two demo skills ship in `.agents/skills/`: `conventional-commits` (how to stage and
+write a commit) and `go-table-tests` (house style for Go tests). Their
+name+description are advertised in the system prompt; the model loads a
+skill's full instructions only when relevant, via the `skill` tool:
+
+```
+> écris un test pour la fonction truncate
+⏺ skill {"name":"go-table-tests"}
+⏺ read_file {"path":"render.go"}
+...
+```
+
+The `explore` tool is a **sub-agent**: a second, read-only agent (read_file,
+list_dir, grep, glob only — filtered by each tool's own `ToolMetadata`)
+exposed to the main agent with `agent.AsTool`. The main agent delegates
+"where is X? / how does Y work?" questions to it and receives only the final
+summary, keeping large intermediate file dumps out of its own context. Each
+delegation is gated by the main agent's Approver; the sub-agent itself needs
+none since it cannot write, shell out, or reach the network.
 
 Then just talk to it:
 
@@ -54,6 +80,8 @@ prompt for approval (`y` once, `a` always for that exact call, `n` deny).
 | `main.go` | `agent.New` + `agent.Config` guardrails (`MaxTurns`, `MaxToolRepeats`, `MaxStreamRetries`, `ToolTimeout`, `MaxParallelTools`), compaction (`agent.Summarize` + `CompactAfter` + `CountTokens`), provider selection behind the `gage.Provider` port, tool registry assembly (`tools.NewFSTools`/`NewSearchTools`/`NewBashTool`/`NewWebTools`, `LimitResultSizeAll`), session persistence (`sessions.NewFileStore`, `gage.Session`), cost estimation (`pricing.Cost`) |
 | `approver.go` | a custom `gage.Approver`: auto-allow read-only local tools via `ToolMetadata`, prompt for the rest, remembered decisions with `gage.RememberingPerInput` |
 | `codex.go` | the OAuth way of connecting: `codex.Login` (PKCE, localhost callback), a file-backed `gage.TokenStore` (`oauth.NewFileStore`), and `codex.New` with transparent token refresh |
+| `skills.go` + `.agents/skills/` | loading SKILL.md folders with `skills.LoadDir`, advertising them via `agent.Config.Skills`, on-demand loading through `skills.NewTool` |
+| `subagent.go` | sub-agent delegation with `agent.AsTool`: a read-only explorer agent exposed as an `explore` tool, tool subset selected by `ToolMetadata` |
 | `render.go` | consuming the `gage.Event` stream: text/reasoning deltas, tool calls and results, resetting partial output on `message_start` after a mid-stream retry |
 
 ## Security posture (deliberate defaults)
@@ -85,9 +113,6 @@ Things a real opencode-style CLI would add, and where gage already helps:
   Approver, persist the `gage.Checkpoint` from the `paused` event, resume with
   `agent.Resume` (see the `workflow` package for a durable wrapper).
 - **MCP servers** — `mcp.New` adapts any MCP server's tools into the registry.
-- **Skills** — load `SKILL.md` folders with `skills.Load` and register
-  `skills.NewTool`.
-- **Sub-agents** — see `agent/subagent.go` for delegating scoped tasks.
 - **Observability** — plug `otelgage` (nested module `otel/`) into
   `agent.Config.Observer` for OpenTelemetry spans.
 - **Testing your agent** — script a fake provider with `gagetest` and assert

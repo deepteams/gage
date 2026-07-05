@@ -7,6 +7,8 @@
 //   - the built-in coding tools (read_file/write_file/edit/list_dir, grep/glob,
 //     bash, web_fetch/web_search) confined to a workspace root
 //   - an interactive terminal Approver with per-input remembered decisions
+//   - SKILL.md skills advertised in the system prompt and loaded on demand
+//   - a read-only "explore" sub-agent the model can delegate questions to
 //   - the agent loop with guardrails (turn cap, loop detection, stream
 //     retries, per-tool timeouts) and context compaction
 //   - streaming rendering of gage.Events
@@ -39,6 +41,7 @@ import (
 	"github.com/deepteams/gage/providers/openrouter"
 	"github.com/deepteams/gage/search/duckduckgo"
 	"github.com/deepteams/gage/sessions"
+	"github.com/deepteams/gage/skills"
 	"github.com/deepteams/gage/tools"
 )
 
@@ -48,13 +51,14 @@ func main() {
 	sessionID := flag.String("session", "", "session name to persist and resume the conversation")
 	yolo := flag.Bool("yolo", false, "skip tool approval prompts (only for trusted tasks)")
 	login := flag.String("login", "", `run an OAuth login flow ("codex") and exit`)
+	skillsDir := flag.String("skills", ".agents/skills", "directory of SKILL.md skill folders, resolved against -root (missing dir: no skills)")
 	flag.Parse()
 
 	var err error
 	if *login != "" {
 		err = runLogin(*login)
 	} else {
-		err = run(*root, *model, *sessionID, *yolo)
+		err = run(*root, *model, *sessionID, *skillsDir, *yolo)
 	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "gage-coding:", err)
@@ -75,7 +79,7 @@ func runLogin(provider string) error {
 	}
 }
 
-func run(root, model, sessionID string, yolo bool) error {
+func run(root, model, sessionID, skillsDir string, yolo bool) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
@@ -102,11 +106,36 @@ func run(root, model, sessionID string, yolo bool) error {
 		approver = gage.RememberingPerInput(&terminalApprover{in: stdin, out: os.Stdout})
 	}
 
+	// Skills: SKILL.md folders advertised in the system prompt (Config.Skills)
+	// and loaded on demand by the model through the "skill" tool. The default
+	// .agents/skills follows the cross-tool convention and is a per-project
+	// location, so a relative -skills path resolves against the workspace root.
+	if !filepath.IsAbs(skillsDir) {
+		skillsDir = filepath.Join(absRoot, skillsDir)
+	}
+	skillSet, err := loadSkills(skillsDir)
+	if err != nil {
+		return err
+	}
+	var extra []gage.Tool
+	if skillSet != nil {
+		extra = append(extra, skills.NewTool(skillSet))
+	}
+
+	// Sub-agent: a read-only explorer the model can delegate codebase
+	// questions to (see subagent.go).
+	explore, err := newExplorerTool(provider, absRoot)
+	if err != nil {
+		return err
+	}
+	extra = append(extra, explore)
+
 	ag, err := agent.New(agent.Config{
 		Name:     "gage-coding",
 		Provider: provider,
 		System:   systemPrompt(absRoot),
-		Registry: newRegistry(absRoot),
+		Registry: newRegistry(absRoot, extra...),
+		Skills:   skillSet,
 		Approver: approver,
 
 		// Guardrails: bound the loop, catch identical-tool-call loops, retry
@@ -136,6 +165,13 @@ func run(root, model, sessionID string, yolo bool) error {
 	}
 
 	fmt.Printf("gage-coding · %s · root %s (/quit to exit)\n", modelID, absRoot)
+	if skillSet != nil {
+		names := make([]string, 0, skillSet.Len())
+		for _, sk := range skillSet.List() {
+			names = append(names, sk.Name)
+		}
+		fmt.Printf("skills: %s\n", strings.Join(names, ", "))
+	}
 
 	r := &renderer{out: os.Stdout}
 	for {
@@ -238,8 +274,9 @@ func pickProvider(ctx context.Context, model string) (gage.Provider, string, err
 	return ollama.New(base, ollama.WithDefaultModel(model)), model, nil
 }
 
-// newRegistry assembles the built-in coding tool set, confined to root.
-func newRegistry(root string) gage.ToolRegistry {
+// newRegistry assembles the built-in coding tool set, confined to root, plus
+// any extra tools (the skill tool, the explore sub-agent).
+func newRegistry(root string, extra ...gage.Tool) gage.ToolRegistry {
 	fsCfg := tools.FSConfig{Root: root} // symlink-safe: paths cannot escape root
 
 	all := tools.NewFSTools(fsCfg)                    // read_file, write_file, edit, list_dir
@@ -252,6 +289,7 @@ func newRegistry(root string) gage.ToolRegistry {
 	// Private-host blocking stays enabled on web_fetch: the model cannot
 	// reach localhost or link-local addresses.
 	all = append(all, tools.NewWebTools(tools.WebConfig{Search: duckduckgo.New()})...)
+	all = append(all, extra...)
 
 	// Cap every tool result so a huge file or command output cannot blow up
 	// the context window.
