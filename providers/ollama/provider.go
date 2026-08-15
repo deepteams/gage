@@ -41,6 +41,8 @@ func WithOpenAICompat() Option {
 }
 
 // New builds an Ollama provider. baseURL may be empty to use DefaultBaseURL.
+// The returned provider also implements gage.ModelLister (native: /api/tags,
+// OpenAI-compat: /v1/models).
 func New(baseURL string, opts ...Option) gage.Provider {
 	cfg := config{baseURL: DefaultBaseURL}
 	if baseURL != "" {

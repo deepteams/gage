@@ -30,6 +30,7 @@ func WithHTTPClient(h *shared.Client) Option {
 
 // New builds a vLLM provider. baseURL is the server root, e.g.
 // "http://localhost:8000" (the "/v1" suffix is added automatically if absent).
+// The returned provider also implements gage.ModelLister (GET /v1/models).
 func New(baseURL string, opts ...Option) gage.Provider {
 	c := &openai.ChatClient{
 		ProviderName: "vllm",

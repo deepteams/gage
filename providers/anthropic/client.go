@@ -34,9 +34,10 @@ const (
 
 var defaultHTTP = shared.NewClient("gage/anthropic")
 
-// Client implements gage.Provider against the Anthropic Messages API. It is
-// the reusable wire layer: the API-key provider built by New and the
-// claudecode OAuth provider both configure one.
+// Client implements gage.Provider against the Anthropic Messages API, plus the
+// optional gage.TokenCounter (count.go) and gage.ModelLister (models.go)
+// capabilities. It is the reusable wire layer: the API-key provider built by
+// New and the claudecode OAuth provider both configure one.
 type Client struct {
 	// ProviderName is reported by Name() and used in errors.
 	ProviderName string

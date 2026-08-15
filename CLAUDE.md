@@ -40,7 +40,10 @@ Everything streams end to end via `<-chan gage.Event`.
     `providers/gemini` speaks the Gemini API natively (streaming, thinking
     signatures, `countTokens`). `providers/fallback` chains several providers:
     it fails over to the next one when a provider errors before producing any
-    content. Embedder adapters: `openai.Embeddings` (any OpenAI-compatible
+    content. `gage.ModelLister` is implemented by `openai.ChatClient` (`GET
+    /models` — covers openrouter, vllm, ollama in OpenAI-compat mode),
+    ollama's native provider (`/api/tags`), `anthropic.Client` (`GET
+    /v1/models`, paginated), and gemini. Embedder adapters: `openai.Embeddings` (any OpenAI-compatible
     `/embeddings` endpoint) and `ollama.Embedder`.
   - `tools/` — built-in tools, `Typed[T]` reflected tools, `MapRegistry`, the
     permission `Guard`, and the `LimitConcurrency`/`LimitResultSize` wrappers.

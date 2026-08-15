@@ -20,7 +20,8 @@ import (
 var defaultChatHTTP = shared.NewClient("gage/openai")
 
 // ChatClient talks to an OpenAI-compatible /chat/completions endpoint and
-// streams the response as gage.Events.
+// streams the response as gage.Events. It also implements gage.ModelLister
+// via the sibling /models endpoint (models.go).
 type ChatClient struct {
 	// ProviderName is reported by Name() (e.g. "openrouter").
 	ProviderName string

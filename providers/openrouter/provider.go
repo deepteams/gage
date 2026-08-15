@@ -45,7 +45,8 @@ func WithReferer(referer, title string) Option {
 	}
 }
 
-// New builds an OpenRouter provider. apiKey is required.
+// New builds an OpenRouter provider. apiKey is required. The returned provider
+// also implements gage.ModelLister (GET /models, including context sizes).
 func New(apiKey string, opts ...Option) gage.Provider {
 	c := &openai.ChatClient{
 		ProviderName: "openrouter",
