@@ -166,6 +166,9 @@ func applyChatOptions(body map[string]any, o gage.GenerateOptions, provider stri
 		body["tool_choice"] = toChatToolChoice(*o.ToolChoice)
 	}
 	if o.ReasoningEffort != gage.ReasoningNone {
+		// Sent verbatim: the effort is an open string, so a gateway's own
+		// levels (llm-router model profiles, vLLM, OpenRouter) reach the
+		// backend unchanged.
 		body["reasoning_effort"] = string(o.ReasoningEffort)
 	}
 	if rf := o.ResponseFormat; rf != nil {

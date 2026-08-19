@@ -117,6 +117,8 @@ func (c *ResponsesClient) buildBody(req gage.Request) ([]byte, error) {
 		body["tool_choice"] = toResponsesToolChoice(*req.Options.ToolChoice)
 	}
 	if req.Options.ReasoningEffort != gage.ReasoningNone {
+		// Verbatim, like Chat Completions: unknown labels belong to the
+		// gateway/backend, not to this encoder.
 		body["reasoning"] = map[string]any{"effort": string(req.Options.ReasoningEffort)}
 		if !c.Store {
 			// With store=false the server keeps no state, so replayable

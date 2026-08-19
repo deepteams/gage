@@ -60,7 +60,10 @@ func (c *Client) buildBodyMap(req gage.Request) (b map[string]any, structured bo
 	if len(req.Tools) > 0 {
 		b["tools"] = toTools(req.Tools)
 	}
-	applyOptions(b, req.Options)
+	pinnedMax := req.Options.MaxTokens > 0 || c.MaxTokens > 0
+	if err := applyOptions(c.ProviderName, b, req.Options, maxTokens, pinnedMax); err != nil {
+		return nil, false, err
+	}
 	if rf := req.Options.ResponseFormat; rf != nil && rf.Type != "" && rf.Type != gage.ResponseText {
 		if c.DisableResponseFormat {
 			return nil, false, gage.Unsupported(c.ProviderName, "response_format")
@@ -246,7 +249,7 @@ func toTools(tools []gage.ToolSchema) []map[string]any {
 	return out
 }
 
-func applyOptions(body map[string]any, o gage.GenerateOptions) {
+func applyOptions(provider string, body map[string]any, o gage.GenerateOptions, maxTokens int, pinnedMax bool) error {
 	if o.Temperature != nil {
 		body["temperature"] = *o.Temperature
 	}
@@ -257,19 +260,61 @@ func applyOptions(body map[string]any, o gage.GenerateOptions) {
 		body["stop_sequences"] = o.StopSequences
 	}
 	if o.ReasoningEffort != gage.ReasoningNone {
-		// Map effort to a thinking token budget.
-		budget := map[gage.ReasoningEffort]int{
-			gage.ReasoningLow:    2048,
-			gage.ReasoningMedium: 8192,
-			gage.ReasoningHigh:   16384,
-		}[o.ReasoningEffort]
-		if budget > 0 {
-			body["thinking"] = map[string]any{"type": "enabled", "budget_tokens": budget}
+		if err := applyThinking(provider, body, o.ReasoningEffort, maxTokens, pinnedMax); err != nil {
+			return err
 		}
 	}
 	if o.ToolChoice != nil {
 		body["tool_choice"] = toToolChoice(*o.ToolChoice)
 	}
+	return nil
+}
+
+// thinkingBudgets maps the portable effort levels onto Anthropic thinking
+// token budgets.
+var thinkingBudgets = map[gage.ReasoningEffort]int{
+	gage.ReasoningMinimal: 1024,
+	gage.ReasoningLow:     2048,
+	gage.ReasoningMedium:  8192,
+	gage.ReasoningHigh:    16384,
+	gage.ReasoningXHigh:   24576,
+	gage.ReasoningMax:     32768,
+}
+
+// minThinkingBudget is the smallest budget_tokens the Messages API accepts.
+const minThinkingBudget = 1024
+
+// applyThinking translates a reasoning effort into a thinking block. Labels
+// outside the portable scale (a gateway's own level) cannot be turned into a
+// budget, so they fail fast rather than being dropped.
+//
+// The API requires minThinkingBudget <= budget_tokens < max_tokens. When the
+// caller pinned max_tokens the budget is clamped to fit it (their cap wins);
+// when it only comes from a default, max_tokens is raised instead so the
+// requested effort survives with room left for the answer.
+func applyThinking(provider string, body map[string]any, effort gage.ReasoningEffort, maxTokens int, pinnedMax bool) error {
+	level, ok := effort.Canonical()
+	if !ok {
+		return gage.Unsupported(provider, "reasoning_effort="+string(effort))
+	}
+	if level == gage.ReasoningOff {
+		body["thinking"] = map[string]any{"type": "disabled"}
+		return nil
+	}
+	budget := thinkingBudgets[level]
+	if budget >= maxTokens {
+		if pinnedMax {
+			budget = maxTokens - 1
+		} else {
+			body["max_tokens"] = budget + maxTokens
+		}
+	}
+	if budget < minThinkingBudget {
+		return fmt.Errorf("%s: reasoning_effort=%s needs max_tokens > %d, got %d",
+			provider, effort, minThinkingBudget, maxTokens)
+	}
+	body["thinking"] = map[string]any{"type": "enabled", "budget_tokens": budget}
+	return nil
 }
 
 func toToolChoice(tc gage.ToolChoice) map[string]any {

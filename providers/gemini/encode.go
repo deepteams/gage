@@ -197,11 +197,16 @@ func toFunctionCallingConfig(provider string, tc gage.ToolChoice) (map[string]an
 
 // thinkingBudgets maps the portable effort levels onto Gemini thinking-token
 // budgets. The values are a documented heuristic, mirroring how the Anthropic
-// adapter maps effort to budget_tokens.
+// adapter maps effort to budget_tokens. 32768 is the ceiling the API accepts,
+// so xhigh and max both request it.
 var thinkingBudgets = map[gage.ReasoningEffort]int{
-	gage.ReasoningLow:    1024,
-	gage.ReasoningMedium: 8192,
-	gage.ReasoningHigh:   24576,
+	gage.ReasoningOff:     0,
+	gage.ReasoningMinimal: 512,
+	gage.ReasoningLow:     1024,
+	gage.ReasoningMedium:  8192,
+	gage.ReasoningHigh:    24576,
+	gage.ReasoningXHigh:   32768,
+	gage.ReasoningMax:     32768,
 }
 
 func generationConfig(provider string, o gage.GenerateOptions) (map[string]any, error) {
@@ -232,12 +237,15 @@ func generationConfig(provider string, o gage.GenerateOptions) (map[string]any, 
 		}
 	}
 	if o.ReasoningEffort != gage.ReasoningNone {
-		budget, ok := thinkingBudgets[o.ReasoningEffort]
+		// A label outside the portable scale (a gateway's own level) cannot be
+		// turned into a budget; fail fast rather than drop it.
+		level, ok := o.ReasoningEffort.Canonical()
 		if !ok {
 			return nil, gage.Unsupported(provider, "reasoning_effort="+string(o.ReasoningEffort))
 		}
+		budget := thinkingBudgets[level]
 		gc["thinkingConfig"] = map[string]any{
-			"includeThoughts": true,
+			"includeThoughts": budget > 0,
 			"thinkingBudget":  budget,
 		}
 	}

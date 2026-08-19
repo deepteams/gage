@@ -122,6 +122,13 @@ returned `ErrApprovalPending`; the caller persists the checkpoint (see
   where the provider has no explicit cache control.
 - Stop reasons are typed (`gage.StopReason`); providers normalize their wire
   values onto the `Stop*` constants and pass unknown values through verbatim.
+- `gage.ReasoningEffort` is an open string, not a closed enum: the constants
+  (`ReasoningOff`/`Minimal`/`Low`/`Medium`/`High`/`XHigh`/`Max`) are the
+  portable scale and `Canonical` folds common spellings onto it. Providers that
+  forward a label (OpenAI-compat, so any gateway model profile) send it
+  verbatim; providers that must translate it into a thinking budget (anthropic,
+  gemini) map the canonical level and fail with `ErrUnsupported` on an
+  unrecognized one.
 - Tool-level failures are returned as a `ToolResult` with `IsError: true` (so
   the model sees them), **not** as a Go `error`. Reserve the `error` return for
   infrastructure failures.

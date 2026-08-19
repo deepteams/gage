@@ -40,8 +40,11 @@ func buildNativeBody(req gage.Request, defaultModel string) ([]byte, error) {
 		return nil, gage.Unsupported("ollama", "tool_choice")
 	}
 	if req.Options.ReasoningEffort != gage.ReasoningNone {
-		// Ollama's thinking switch is boolean; any requested effort enables it.
-		body["think"] = true
+		// Ollama's thinking switch is boolean: an explicit "off" turns it off,
+		// any other effort (portable level or a gateway's own label) enables it
+		// without granularity.
+		level, _ := req.Options.ReasoningEffort.Canonical()
+		body["think"] = level != gage.ReasoningOff
 	}
 	if rf := req.Options.ResponseFormat; rf != nil {
 		switch rf.Type {

@@ -229,3 +229,35 @@ func TestNativeDocumentPartsUnsupported(t *testing.T) {
 		t.Fatalf("err = %v, want ErrUnsupported", err)
 	}
 }
+
+func TestNativeThinkSwitch(t *testing.T) {
+	cases := []struct {
+		effort gage.ReasoningEffort
+		want   any
+	}{
+		{gage.ReasoningNone, nil},
+		{gage.ReasoningOff, false},
+		{gage.ReasoningLow, true},
+		// A gateway's own label still enables thinking (the switch is boolean).
+		{"turbo", true},
+	}
+	for _, tc := range cases {
+		t.Run(string(tc.effort), func(t *testing.T) {
+			raw, err := buildNativeBody(gage.Request{
+				Model:    "llama3",
+				Messages: []gage.Message{gage.UserText("hi")},
+				Options:  gage.GenerateOptions{ReasoningEffort: tc.effort},
+			}, "llama3")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var body map[string]any
+			if err := json.Unmarshal(raw, &body); err != nil {
+				t.Fatal(err)
+			}
+			if body["think"] != tc.want {
+				t.Fatalf("think = %v, want %v", body["think"], tc.want)
+			}
+		})
+	}
+}

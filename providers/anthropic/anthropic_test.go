@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -449,5 +450,61 @@ func TestCountTokensAPIError(t *testing.T) {
 	var apiErr *gage.APIError
 	if !errors.As(err, &apiErr) || apiErr.Status != http.StatusBadRequest {
 		t.Fatalf("err = %v, want *gage.APIError with status 400", err)
+	}
+}
+
+func TestThinkingMapping(t *testing.T) {
+	c := &Client{ProviderName: "anthropic", DefaultModel: "claude-x"}
+	cases := []struct {
+		name      string
+		effort    gage.ReasoningEffort
+		maxTokens int
+		want      map[string]any // nil = no thinking block
+		wantMax   int            // expected max_tokens, 0 = unchanged
+		wantErr   bool
+	}{
+		{name: "unset"},
+		{name: "off", effort: gage.ReasoningOff, want: map[string]any{"type": "disabled"}},
+		{name: "minimal", effort: gage.ReasoningMinimal, want: map[string]any{"type": "enabled", "budget_tokens": 1024}},
+		// max_tokens left to the default: it is raised to fit the budget.
+		{name: "high", effort: gage.ReasoningHigh, want: map[string]any{"type": "enabled", "budget_tokens": 16384}, wantMax: 16384 + DefaultMaxTokens},
+		// Aliases fold onto the portable scale.
+		{name: "alias ultra", effort: "Ultra", want: map[string]any{"type": "enabled", "budget_tokens": 32768}, wantMax: 32768 + DefaultMaxTokens},
+		// budget_tokens must stay strictly below max_tokens.
+		{name: "clamped", effort: gage.ReasoningMax, maxTokens: 4096, want: map[string]any{"type": "enabled", "budget_tokens": 4095}},
+		// ... and above the API minimum, otherwise the request is rejected.
+		{name: "max_tokens too small", effort: gage.ReasoningLow, maxTokens: 512, wantErr: true},
+		// A gateway's own label cannot be turned into a budget.
+		{name: "unknown", effort: "turbo", wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b, _, err := c.buildBodyMap(gage.Request{
+				Messages: []gage.Message{gage.UserText("hi")},
+				Options:  gage.GenerateOptions{ReasoningEffort: tc.effort, MaxTokens: tc.maxTokens},
+			})
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("thinking = %v, want error", b["thinking"])
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, _ := b["thinking"].(map[string]any)
+			if tc.want == nil {
+				if got != nil {
+					t.Fatalf("thinking = %v, want none", got)
+				}
+				return
+			}
+			if got["type"] != tc.want["type"] || fmt.Sprint(got["budget_tokens"]) != fmt.Sprint(tc.want["budget_tokens"]) {
+				t.Fatalf("thinking = %v, want %v", got, tc.want)
+			}
+			if tc.wantMax > 0 && fmt.Sprint(b["max_tokens"]) != fmt.Sprint(tc.wantMax) {
+				t.Fatalf("max_tokens = %v, want %d", b["max_tokens"], tc.wantMax)
+			}
+		})
 	}
 }

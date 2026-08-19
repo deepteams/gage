@@ -404,7 +404,7 @@ func TestUnsupportedFailFast(t *testing.T) {
 		opts gage.GenerateOptions
 	}{
 		{"response_format", gage.GenerateOptions{ResponseFormat: &gage.ResponseFormat{Type: "xml"}}},
-		{"reasoning_effort", gage.GenerateOptions{ReasoningEffort: "ultra"}},
+		{"reasoning_effort", gage.GenerateOptions{ReasoningEffort: "turbo"}}, // not on the portable scale
 		{"tool_choice", gage.GenerateOptions{ToolChoice: &gage.ToolChoice{Mode: "weird"}}},
 	}
 	for _, tc := range cases {
@@ -543,5 +543,46 @@ func TestModelPrefixStripped(t *testing.T) {
 	collect(t, ch)
 	if !strings.HasPrefix(reqURL, "/models/gemini-x:streamGenerateContent") {
 		t.Fatalf("url = %q", reqURL)
+	}
+}
+
+func TestThinkingConfigMapping(t *testing.T) {
+	cases := []struct {
+		name        string
+		effort      gage.ReasoningEffort
+		wantBudget  float64
+		wantInclude bool
+		wantNone    bool
+	}{
+		{name: "unset", wantNone: true},
+		{name: "off", effort: gage.ReasoningOff},
+		{name: "minimal", effort: gage.ReasoningMinimal, wantBudget: 512, wantInclude: true},
+		{name: "high", effort: gage.ReasoningHigh, wantBudget: 24576, wantInclude: true},
+		// Aliases fold onto the portable scale; the API caps thinking at 32768.
+		{name: "alias ultra", effort: "ULTRA", wantBudget: 32768, wantInclude: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gc, err := generationConfig("gemini", gage.GenerateOptions{ReasoningEffort: tc.effort})
+			if err != nil {
+				t.Fatal(err)
+			}
+			tcfg, _ := gc["thinkingConfig"].(map[string]any)
+			if tc.wantNone {
+				if tcfg != nil {
+					t.Fatalf("thinkingConfig = %v, want none", tcfg)
+				}
+				return
+			}
+			if tcfg == nil {
+				t.Fatal("thinkingConfig missing")
+			}
+			if got := float64(tcfg["thinkingBudget"].(int)); got != tc.wantBudget {
+				t.Fatalf("thinkingBudget = %v, want %v", got, tc.wantBudget)
+			}
+			if tcfg["includeThoughts"] != tc.wantInclude {
+				t.Fatalf("includeThoughts = %v, want %v", tcfg["includeThoughts"], tc.wantInclude)
+			}
+		})
 	}
 }

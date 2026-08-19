@@ -1,15 +1,86 @@
 package gage
 
+import "strings"
+
 // ReasoningEffort hints how much internal reasoning the model should spend, for
 // providers that support it (Codex/Responses, Anthropic thinking, etc.).
+//
+// It is an open string, not a closed enum: gateways (llm-router, vLLM,
+// OpenRouter) publish their own levels per model, and OpenAI-compatible
+// providers forward the value verbatim. The constants below are the portable
+// levels, ordered from least to most reasoning; Canonical folds the spellings
+// seen in the wild onto them so providers that need a thinking-token budget
+// (anthropic, gemini) can still map an arbitrary label.
 type ReasoningEffort string
 
 const (
-	ReasoningNone   ReasoningEffort = ""
-	ReasoningLow    ReasoningEffort = "low"
-	ReasoningMedium ReasoningEffort = "medium"
-	ReasoningHigh   ReasoningEffort = "high"
+	// ReasoningNone leaves the effort unset: the provider's own default applies
+	// and nothing is sent on the wire.
+	ReasoningNone ReasoningEffort = ""
+	// ReasoningOff asks for reasoning to be disabled explicitly, for providers
+	// that can say so (Anthropic thinking.disabled, Gemini budget 0, ollama
+	// think:false, OpenAI "none").
+	ReasoningOff     ReasoningEffort = "none"
+	ReasoningMinimal ReasoningEffort = "minimal"
+	ReasoningLow     ReasoningEffort = "low"
+	ReasoningMedium  ReasoningEffort = "medium"
+	ReasoningHigh    ReasoningEffort = "high"
+	ReasoningXHigh   ReasoningEffort = "xhigh"
+	ReasoningMax     ReasoningEffort = "max"
 )
+
+// reasoningAliases folds alternative spellings onto the portable levels. Keys
+// are normalized by reasoningKey (lowercased, separators removed).
+var reasoningAliases = map[string]ReasoningEffort{
+	"":          ReasoningNone,
+	"none":      ReasoningOff,
+	"off":       ReasoningOff,
+	"disabled":  ReasoningOff,
+	"false":     ReasoningOff,
+	"no":        ReasoningOff,
+	"0":         ReasoningOff,
+	"minimal":   ReasoningMinimal,
+	"min":       ReasoningMinimal,
+	"verylow":   ReasoningMinimal,
+	"lowest":    ReasoningMinimal,
+	"low":       ReasoningLow,
+	"medium":    ReasoningMedium,
+	"med":       ReasoningMedium,
+	"mid":       ReasoningMedium,
+	"moderate":  ReasoningMedium,
+	"high":      ReasoningHigh,
+	"xhigh":     ReasoningXHigh,
+	"extrahigh": ReasoningXHigh,
+	"veryhigh":  ReasoningXHigh,
+	"max":       ReasoningMax,
+	"maximum":   ReasoningMax,
+	"highest":   ReasoningMax,
+	"ultra":     ReasoningMax,
+}
+
+// reasoningKey normalizes a label for alias lookup: lowercase, with spaces,
+// dashes and underscores removed ("Extra-High" and "extra_high" both match).
+func reasoningKey(e ReasoningEffort) string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(string(e)) {
+		switch r {
+		case ' ', '-', '_', '\t':
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// Canonical folds e onto one of the portable levels. ok is false when the
+// label is not recognized: OpenAI-compatible providers pass such values
+// through verbatim (the gateway or backend knows them), while providers that
+// must translate the effort into a budget fail with ErrUnsupported rather than
+// silently dropping it.
+func (e ReasoningEffort) Canonical() (level ReasoningEffort, ok bool) {
+	level, ok = reasoningAliases[reasoningKey(e)]
+	return level, ok
+}
 
 // ResponseFormatType selects how the model's final answer is constrained.
 type ResponseFormatType string
